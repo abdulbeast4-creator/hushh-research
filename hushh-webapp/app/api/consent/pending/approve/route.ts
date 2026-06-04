@@ -10,6 +10,10 @@
 
 import { NextRequest, NextResponse } from "next/server";
 import { getPythonApiUrl } from "@/app/api/_utils/backend";
+import {
+  isPurposeValid,
+  APPROVED_CONSENT_PURPOSES,
+} from "@/lib/consent/purposeValidator";
 
 const BACKEND_URL = getPythonApiUrl();
 
@@ -36,6 +40,17 @@ export async function POST(request: NextRequest) {
     if (!userId || !requestId) {
       return NextResponse.json(
         { error: "userId and requestId are required" },
+        { status: 400 }
+      );
+    }
+
+    // Reject requests that declare a consent purpose not in the approved tier
+    // list.  Validation runs before any backend call so the Python service
+    // never receives an unrecognised purpose value.
+    const { purpose } = body as { purpose?: unknown };
+    if (purpose !== undefined && !isPurposeValid(purpose, APPROVED_CONSENT_PURPOSES)) {
+      return NextResponse.json(
+        { error: `consent purpose "${String(purpose)}" is not in the permitted tier list` },
         { status: 400 }
       );
     }
