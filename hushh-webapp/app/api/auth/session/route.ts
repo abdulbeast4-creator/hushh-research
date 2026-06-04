@@ -12,6 +12,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { cookies } from "next/headers";
 import { createSessionCookie, verifySessionCookie } from "@/lib/firebase/admin";
+import { isTokenExpired } from "@/lib/privacy/tokenGuard";
 
 // Session cookie name
 const SESSION_COOKIE_NAME = "hushh_session";
@@ -32,6 +33,23 @@ export async function POST(request: NextRequest) {
       return NextResponse.json(
         { error: "ID token is required" },
         { status: 400 }
+      );
+    }
+
+    // Defence-in-depth: if the caller supplies a tokenIssuedAt timestamp
+    // (epoch ms), reject the request before the Firebase Admin SDK call when
+    // the token is older than the maximum accepted age.  This prevents stale
+    // ID tokens from reaching the session cookie creation path even if the
+    // Firebase expiry window has not yet closed server-side.
+    const { tokenIssuedAt } = body as { tokenIssuedAt?: unknown };
+    const TOKEN_MAX_AGE_SECONDS = 3600; // 1 hour hard ceiling
+    if (tokenIssuedAt !== undefined && isTokenExpired(
+      { createdAt: tokenIssuedAt },
+      TOKEN_MAX_AGE_SECONDS
+    )) {
+      return NextResponse.json(
+        { error: "ID token has exceeded the maximum accepted age" },
+        { status: 401 }
       );
     }
 
