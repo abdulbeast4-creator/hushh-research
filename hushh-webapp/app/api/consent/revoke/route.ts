@@ -12,6 +12,7 @@ import {
   invalidJsonPayloadResponse,
   readJsonObject,
 } from "@/app/api/_utils/json-body";
+import { resolveConsentState } from "@/lib/consent/overrideEvaluator";
 
 const BACKEND_URL = getPythonApiUrl();
 
@@ -20,11 +21,31 @@ export async function POST(request: NextRequest) {
     const body = (await readJsonObject(request)) as {
       userId?: string;
       scope?: string;
+      globalStatus?: unknown;
+      localOverride?: unknown;
     } | null;
     if (!body) {
       return invalidJsonPayloadResponse();
     }
-    const { userId, scope } = body;
+    const { userId, scope, globalStatus, localOverride } = body;
+
+    // Resolve the effective consent state from the two-tier cascade before
+    // forwarding to the backend.  When a caller supplies explicit state flags
+    // and the resolved state is already inactive (false), the consent is
+    // already revoked — return early rather than sending a no-op to the
+    // Python service.
+    if (globalStatus !== undefined || localOverride !== undefined) {
+      const effectiveConsent = resolveConsentState(globalStatus, localOverride);
+      if (!effectiveConsent) {
+        return NextResponse.json(
+          {
+            status: "already_inactive",
+            message: "Consent is already inactive — revocation is a no-op",
+          },
+          { status: 200 }
+        );
+      }
+    }
     const authHeader =
       request.headers.get("authorization") ||
       request.headers.get("Authorization");
