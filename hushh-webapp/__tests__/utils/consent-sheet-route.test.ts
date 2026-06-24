@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   buildConsentCenterHref,
   buildRiaConsentManagerHref,
+  isInternalAppHref,
   resolveConsentNavigationTarget,
   normalizeInternalAppHref,
   resolveConsentRequestHref,
@@ -226,3 +227,53 @@ describe("path resolver safety — dangerous edge case handling", () => {
   });
 });
 // ── End path safety coverage ──────────────────────────────────────────────────
+
+// ── Escaped control sequence stripping (PR #3379 attach point) ────────────────
+// Control bytes must never survive into the resolved navigation target, and a
+// real "/consents…" link carrying a stray control byte must still classify as
+// an internal SPA route rather than silently falling through to external nav.
+
+describe("control sequence stripping in href classification", () => {
+  it("normalizeInternalAppHref strips an embedded NUL and keeps the consent route relative", () => {
+    expect(normalizeInternalAppHref("/consents\u0000?tab=pending")).toBe(
+      "/consents?tab=pending",
+    );
+  });
+
+  it("normalizeInternalAppHref strips an embedded newline/CR pair from a consent route", () => {
+    expect(normalizeInternalAppHref("/consents\r\n?tab=active")).toBe(
+      "/consents?tab=active",
+    );
+  });
+
+  it("normalizeInternalAppHref strips percent-encoded control bytes (%00, %0a)", () => {
+    expect(normalizeInternalAppHref("/consents%00%0a?tab=pending")).toBe(
+      "/consents?tab=pending",
+    );
+  });
+
+  it("resolveConsentNavigationTarget classifies a control-injected consent link as internal", () => {
+    const result = resolveConsentNavigationTarget(
+      "/consents\u0000?tab=pending&requestId=req_1",
+    );
+    expect(result.kind).toBe("internal");
+    if (result.kind === "internal") {
+      expect(result.pathname).toBe("/consents");
+      expect(result.href).not.toContain("\u0000");
+    }
+  });
+
+  it("resolveConsentNavigationTarget produces a href free of any control bytes", () => {
+    const result = resolveConsentNavigationTarget(
+      "http://localhost:3000/consents%0d%0a?tab=pending",
+    );
+    expect(/[\u0000-\u001F\u007F]/.test(result.href)).toBe(false);
+    expect(/%0[da]/i.test(result.href)).toBe(false);
+  });
+
+  it("isInternalAppHref treats a control-injected consent link as internal", () => {
+    expect(isInternalAppHref("/consents\u0009?tab=pending")).toBe(true);
+  });
+});
+
+

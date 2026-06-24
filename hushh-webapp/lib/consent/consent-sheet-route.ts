@@ -130,6 +130,26 @@ export function buildConsentCenterHref(
   return query ? `${ROUTES.CONSENTS}?${query}` : ROUTES.CONSENTS;
 }
 
+/**
+ * Strip escaped control sequences from href inputs before classification.
+ *
+ * Covers two forms a malformed/hostile deep link can use to slip a control
+ * character past the prefix allow-list:
+ *   1. literal C0 controls + DEL (\u0000-\u001F, \u007F) — e.g. an embedded
+ *      NUL or newline that breaks an otherwise-valid "/consents" prefix match;
+ *   2. percent-encoded controls (%00-%1F, %7F) — the same bytes URL-encoded.
+ *
+ * A legitimate consent route never contains control bytes, so removing them
+ * keeps a real "/consents…" link classified as an internal SPA route instead
+ * of silently falling through to external navigation.
+ */
+const CONTROL_CHAR_PATTERN = /[\u0000-\u001F\u007F]/g;
+const ENCODED_CONTROL_PATTERN = /%(?:0[0-9A-Fa-f]|1[0-9A-Fa-f]|7[Ff])/g;
+
+function stripControlSequences(value: string): string {
+  return value.replace(CONTROL_CHAR_PATTERN, "").replace(ENCODED_CONTROL_PATTERN, "");
+}
+
 function isKnownInternalAppPath(pathname: string): boolean {
   return INTERNAL_APP_ROUTE_PREFIXES.some((prefix) => {
     if (prefix === ROUTES.HOME) {
@@ -140,7 +160,7 @@ function isKnownInternalAppPath(pathname: string): boolean {
 }
 
 export function isInternalAppHref(href: string | null | undefined): boolean {
-  const trimmed = String(href || "").trim();
+  const trimmed = stripControlSequences(String(href || "").trim());
   if (!trimmed) return false;
   if (trimmed.startsWith("//")) return false;
   if (trimmed.startsWith("/")) {
@@ -155,7 +175,7 @@ export function isInternalAppHref(href: string | null | undefined): boolean {
 }
 
 export function normalizeInternalAppHref(href: string | null | undefined): string | null {
-  const trimmed = String(href || "").trim();
+  const trimmed = stripControlSequences(String(href || "").trim());
   if (!trimmed) return null;
   if (trimmed.startsWith("/") && isKnownInternalAppPath(trimmed.split("?")[0] || trimmed)) {
     return trimmed;
