@@ -68,7 +68,7 @@ export function OnboardingShell({
             />
           ))}
         </div>
-        <span role="status" aria-atomic="true" className="sr-only">
+        <span role="status" aria-live="polite" aria-atomic="true" className="sr-only">
           {`Step ${currentStepIndex + 1} of ${totalSteps}`}
         </span>
 

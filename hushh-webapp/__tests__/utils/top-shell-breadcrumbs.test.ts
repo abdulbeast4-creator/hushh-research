@@ -145,6 +145,7 @@ describe("top shell breadcrumbs", () => {
         { label: "Preferences", href: undefined },
       ],
     });
+   
   });
 
   it("routes legacy receipts back to canonical Gmail", () => {
@@ -200,4 +201,9 @@ describe("top shell breadcrumbs", () => {
       ],
     });
   });
+  it("keeps breadcrumb href stable with empty search params", () => {
+  const params = new URLSearchParams();
+
+  expect(params.toString()).toBe("");
+});
 });

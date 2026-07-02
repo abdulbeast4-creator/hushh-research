@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   Popover,
+  PopoverAnchor,
   PopoverContent,
   PopoverDescription,
   PopoverHeader,
@@ -36,6 +37,22 @@ describe("Popover", () => {
     ).toBeTruthy();
   });
 
+  it("preserves PopoverContent data-slot when className is provided", () => {
+    render(
+      <Popover defaultOpen>
+        <PopoverTrigger>Open</PopoverTrigger>
+        <PopoverContent className="custom-popover-content">
+          Content
+        </PopoverContent>
+      </Popover>,
+    );
+
+    const content = document.querySelector('[data-slot="popover-content"]');
+
+    expect(content).toBeTruthy();
+    expect(content?.classList.contains("custom-popover-content")).toBe(true);
+  });
+
   it("renders PopoverHeader with data-slot='popover-header'", () => {
     const { container } = render(<PopoverHeader />);
 
@@ -59,4 +76,37 @@ describe("Popover", () => {
       container.querySelector('[data-slot="popover-description"]'),
     ).toBeTruthy();
   });
+
+  it("renders PopoverAnchor with data-slot='popover-anchor'", () => {
+    const { container } = render(
+      <Popover>
+        <PopoverAnchor />
+      </Popover>,
+    );
+
+    expect(
+      container.querySelector('[data-slot="popover-anchor"]'),
+    ).toBeTruthy();
+  });
+
+  it("renders PopoverTitle as an h2 element", () => {
+    const { container } = render(<PopoverTitle>Section</PopoverTitle>);
+
+    const el = container.querySelector('[data-slot="popover-title"]');
+
+    expect(el?.tagName).toBe("H2");
+  });
+
+  it("renders PopoverDescription as a p element", () => {
+    const { container } = render(
+      <PopoverDescription>Details</PopoverDescription>,
+    );
+
+    const description = container.querySelector(
+      '[data-slot="popover-description"]',
+    );
+
+    expect(description?.tagName).toBe("P");
+  });
+
 });

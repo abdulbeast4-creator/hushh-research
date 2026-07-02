@@ -4294,7 +4294,7 @@ function ProfilePageContent() {
                   trailing={<Badge variant="secondary">Local</Badge>}
                   chevron
                   stackTrailingOnMobile
-                  onClick={() => router.push("/profile/pkm-agent-lab")}
+                  onClick={() => router.push(ROUTES.PROFILE_PKM_AGENT_LAB)}
                 />
               ) : null}
             </SettingsGroup>

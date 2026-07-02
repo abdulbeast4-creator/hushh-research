@@ -49,6 +49,11 @@ async def issue_session_token(
     from hushh_mcp.constants import ConsentScope
 
     try:
+        # Verify Firebase bearer token
+        if not authorization:
+            logger.warning("session_token.missing_auth_header")
+            raise HTTPException(status_code=400, detail="Missing Authorization header")
+        
         verified_uid = verify_firebase_bearer(authorization)
 
         # Ensure request userId matches verified token
@@ -62,8 +67,14 @@ async def issue_session_token(
         raise  # keep original error
 
     except ValueError as e:
-        logger.warning("session_token.invalid_token: %s", e)
-        raise HTTPException(status_code=401, detail="Invalid token")
+        # ValueError from verify_firebase_bearer indicates invalid token format or expiry
+        logger.warning("session_token.invalid_bearer_token: %s", e)
+        raise HTTPException(status_code=401, detail="Invalid or expired bearer token")
+
+    except KeyError as e:
+        # KeyError likely from malformed token structure
+        logger.warning("session_token.malformed_token: %s", e)
+        raise HTTPException(status_code=400, detail="Malformed authorization token")
 
     except Exception as e:
         logger.error("session_token.internal_error: %s", e)
@@ -113,7 +124,7 @@ async def logout_session(
     token_data: dict = Depends(require_vault_owner_token),
 ):
     """
-    Destroy all session tokens for a user.
+    Revoke the presented VAULT_OWNER session token for the authenticated user.
 
     REQUIRES: VAULT_OWNER consent token (via Authorization header).
     Only revokes session tokens (agent_id="self"). External API tokens are

@@ -6,9 +6,11 @@ Modular architecture with routes organized in api/routes/ directory.
 Run with: uvicorn server:app --reload --port 8000
 """
 
+import asyncio
 import logging
 import os
 import time
+from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request  # noqa: E402
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
@@ -16,12 +18,18 @@ from fastapi.responses import JSONResponse, RedirectResponse  # noqa: E402
 
 from hushh_mcp.runtime_settings import get_app_runtime_settings  # noqa: E402
 from mcp_modules.log_redaction import install_sensitive_log_filter  # noqa: E402
+from services.logging_config import RequestContextMiddleware, configure_logging
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
+configure_logging(level="INFO")
 install_sensitive_log_filter()
 logger = logging.getLogger(__name__)
 _APP_RUNTIME_SETTINGS = get_app_runtime_settings()
+_STARTUP_BACKGROUND_TASKS: set[asyncio.Task[None]] = set()
+
+
+def _track_startup_background_task(task: asyncio.Task[None]) -> None:
+    _STARTUP_BACKGROUND_TASKS.add(task)
+    task.add_done_callback(_STARTUP_BACKGROUND_TASKS.discard)
 
 
 def _env_truthy(name: str, fallback: str = "false") -> bool:
@@ -131,6 +139,8 @@ app = FastAPI(
     root_path=root_path,
 )
 
+app.add_middleware(RequestContextMiddleware)
+
 app.middleware("http")(observability_middleware)
 
 # Rate limiting
@@ -156,7 +166,9 @@ def _database_error_payload(
 
 
 @app.exception_handler(DatabaseUnavailableError)
-async def database_unavailable_exception_handler(_request: Request, exc: DatabaseUnavailableError):
+async def database_unavailable_exception_handler(
+    _request: Request, exc: DatabaseUnavailableError
+) -> JSONResponse:
     return JSONResponse(
         status_code=exc.status_code,
         content=_database_error_payload(
@@ -168,7 +180,9 @@ async def database_unavailable_exception_handler(_request: Request, exc: Databas
 
 
 @app.exception_handler(DatabaseExecutionError)
-async def database_execution_exception_handler(_request: Request, exc: DatabaseExecutionError):
+async def database_execution_exception_handler(
+    _request: Request, exc: DatabaseExecutionError
+) -> JSONResponse:
     status_code = getattr(exc, "status_code", 500)
     return JSONResponse(
         status_code=status_code,
@@ -598,9 +612,18 @@ async def startup_market_cache_store_table():
 
 @app.on_event("startup")
 async def startup_market_insights_refresh():
-    """Warm shared market caches, then keep them refreshed in the background."""
-    await warm_market_insights_startup_once()
-    start_market_insights_background_refresh()
+    """Warm shared market caches without blocking health or user traffic."""
+
+    async def _warm_then_refresh() -> None:
+        await warm_market_insights_startup_once()
+        start_market_insights_background_refresh()
+
+    _track_startup_background_task(
+        asyncio.create_task(
+            _warm_then_refresh(),
+            name="market-insights-startup-warm",
+        )
+    )
 
 
 @app.on_event("startup")
@@ -632,7 +655,7 @@ def _require_debug_access() -> None:
 
 
 @app.get("/debug/diagnostics", tags=["Debug"])
-async def diagnostics():
+async def diagnostics() -> dict[str, Any]:
     """List all registered routes to debug 404s."""
     _require_debug_access()
     routes = []
@@ -655,7 +678,7 @@ async def diagnostics():
 
 
 @app.get("/debug/consent-listener", tags=["Debug"])
-async def debug_consent_listener():
+async def debug_consent_listener() -> dict[str, Any]:
     """Consent NOTIFY listener status: listener_active, queue_count, notify_received_count.
     Use to confirm the listener is running and that NOTIFY is being received."""
     _require_debug_access()

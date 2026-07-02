@@ -2031,6 +2031,7 @@ export function KaiMarketPreviewView() {
             <Search className="h-[17px] w-[17px] shrink-0 text-[color:var(--one-fg3)]" />
             <input
               type="text"
+              aria-label="Search stocks, ETFs, indices"
               placeholder="Search stocks, ETFs, indices"
               value={marketSearchQuery}
               onChange={(event) => setMarketSearchQuery(event.target.value)}

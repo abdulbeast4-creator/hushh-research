@@ -400,6 +400,7 @@ export function DebateTaskCenter({ triggerClassName, renderTrigger }: DebateTask
           ) : null}
           {task.status !== "running" ? (
             <Button
+              type="button"
               variant="none"
               effect="fade"
               size="icon"
@@ -544,6 +545,7 @@ export function DebateTaskCenter({ triggerClassName, renderTrigger }: DebateTask
                         ) : null}
                         {item.task.status !== "running" ? (
                           <Button
+                            type="button"
                             variant="none"
                             effect="fade"
                             size="icon"
