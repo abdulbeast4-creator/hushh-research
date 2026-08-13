@@ -6,14 +6,21 @@ import asyncio
 import copy
 import json
 import logging
+import os
 import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
 from db.db_client import DatabaseExecutionError, get_db
+from hushh_mcp.services.crm_encrypted_fields_v1 import (
+    CRM_ENCRYPTED_FIELDS_V1_PROFILE,
+    CrmEncryptedFields,
+    validate_crm_encrypted_fields_envelope,
+    validate_crm_encrypted_fields_recipient_key,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +35,56 @@ REGISTRY_MCP_ENDPOINT = (
     "https://hussh-og-nonprod-ingress-a3e0me.y4rjsf.usa-e2.cloudhub.io/crm-connect/v1/mcp"
 )
 TERMINAL_INTENT_STATUSES = frozenset({"rejected", "succeeded", "partial", "failed"})
+_CRM_ENCRYPTED_FIELDS_ACK_STATUSES = frozenset({"accepted", "success", "succeeded"})
+_OPAQUE_PARTNER_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$")
+
+
+def _crm_encrypted_fields_runtime_enabled() -> bool:
+    """Fail closed outside UAT until the partner contract is production-approved."""
+    return (
+        str(os.getenv("ENVIRONMENT") or os.getenv("HUSHH_DEPLOY_ENV") or "").strip().lower()
+        == "uat"
+    )
+
+
+def _normalize_crm_encrypted_fields_ack(payload: Any) -> dict[str, Any]:
+    """Return the only plaintext partner metadata that may be persisted."""
+    raw = _ensure_dict(payload)
+    if set(raw) - {"status", "accepted", "operationId", "correlationId", "idempotent"}:
+        raise ConnectedSystemConfigurationError(
+            "The CRM partner returned an unsafe acknowledgement.",
+            code="CONNECTED_SYSTEM_CRM_ENCRYPTED_FIELDS_ACK_INVALID",
+            status_code=502,
+        )
+    status = str(raw.get("status") or "").strip().lower()
+    if status not in _CRM_ENCRYPTED_FIELDS_ACK_STATUSES or raw.get("accepted") is not True:
+        raise ConnectedSystemsError(
+            "The CRM partner did not accept the update.",
+            code="CONNECTED_SYSTEM_CRM_ENCRYPTED_FIELDS_UPDATE_UNCONFIRMED",
+            status_code=502,
+        )
+    normalized: dict[str, Any] = {"status": status, "accepted": True}
+    if "idempotent" in raw:
+        if not isinstance(raw["idempotent"], bool):
+            raise ConnectedSystemConfigurationError(
+                "The CRM partner returned an unsafe acknowledgement.",
+                code="CONNECTED_SYSTEM_CRM_ENCRYPTED_FIELDS_ACK_INVALID",
+                status_code=502,
+            )
+        normalized["idempotent"] = raw["idempotent"]
+    for key in ("operationId", "correlationId"):
+        if key not in raw:
+            continue
+        value = raw[key]
+        if not isinstance(value, str) or not _OPAQUE_PARTNER_ID.fullmatch(value):
+            raise ConnectedSystemConfigurationError(
+                "The CRM partner returned an unsafe acknowledgement.",
+                code="CONNECTED_SYSTEM_CRM_ENCRYPTED_FIELDS_ACK_INVALID",
+                status_code=502,
+            )
+        normalized[key] = value
+    return normalized
+
 
 EXTERNAL_CRM_TOOL_CATALOG = (
     {
@@ -634,6 +691,13 @@ def _schema_fields_from_schema_result(
         createable = _descriptor_bool(descriptor, "createable", "isCreateable")
         updateable = _descriptor_bool(descriptor, "updateable", "isUpdateable")
         descriptor_required = _descriptor_bool(descriptor, "required", "isRequired")
+        defaulted_on_create = _descriptor_bool(
+            descriptor,
+            "defaultedOnCreate",
+            "defaulted_on_create",
+            "serverManaged",
+            "systemManaged",
+        )
         # CRM schemas often expose a catalogue before they expose field-level
         # access metadata. Keep that metadata optional: an omitted access bit
         # means "not declared", not an inferred deny or allow. Operation tool
@@ -667,6 +731,7 @@ def _schema_fields_from_schema_result(
                 "updateable": updateable,
                 "writable": writable,
                 "immutable": immutable,
+                "defaultedOnCreate": defaulted_on_create,
                 "permissionsDeclared": permissions_declared,
                 "constraints": _schema_constraints_from_descriptor(descriptor),
                 "source": source,
@@ -951,6 +1016,11 @@ class ConnectedSystemDefinition:
     # Extra MCP tool arguments sourced from the private registry row. These are
     # never exposed in to_summary(); they are merged into the tool call payload.
     transport_tool_arguments: dict[str, Any] | None = None
+    # Trusted server-side connection arguments that remain required when an
+    # encrypted-fields call replaces ordinary tool arguments. This is used only
+    # by the MuleSoft dynamic-registry profile; browser input can never populate
+    # it and it is never exposed by ``to_summary``.
+    transport_replacement_tool_arguments: dict[str, Any] | None = None
     # Salesforce delete uses a different endpoint path than schema/CRUD-read, so
     # the registry can carry a dedicated delete endpoint. None → fall back to
     # transport_endpoint. Only consulted when supports_delete is enabled.
@@ -965,6 +1035,11 @@ class ConnectedSystemDefinition:
     # credentials; both make cache invalidation deterministic for aliased IDs.
     registry_id: str | None = None
     configuration_revision: int = 1
+    # The external CRM field-value profile is deliberately narrow: browser and
+    # MuleSoft handle the values; Hussh only validates envelope metadata,
+    # owner authority, schema and the server-bound CRM record.
+    crm_encrypted_fields_v1_enabled: bool = False
+    crm_encrypted_fields_recipient_key: dict[str, Any] | None = None
 
     def operation(self, operation: str) -> dict[str, Any] | None:
         return next(
@@ -975,6 +1050,34 @@ class ConnectedSystemDefinition:
             ),
             None,
         )
+
+    def object_type_for_operation(self, operation: str) -> str:
+        configured = str((self.operation(operation) or {}).get("objectType") or "").strip()
+        return configured or self.object_type_default
+
+    def crm_encrypted_fields_ready(self, operation: str) -> bool:
+        key = self.crm_encrypted_fields_recipient_key or {}
+        try:
+            validate_crm_encrypted_fields_recipient_key(key)
+        except Exception:
+            return False
+        return bool(
+            self.crm_encrypted_fields_v1_enabled
+            and _crm_encrypted_fields_runtime_enabled()
+            and operation in {"read", "update"}
+            and self.crm_encrypted_fields_tool_name(operation)
+            and key.get("keyId")
+            and key.get("publicKey")
+            and key.get("publicKeyFingerprint")
+            and key.get("environment") == "sandbox"
+        )
+
+    def crm_encrypted_fields_tool_name(self, operation: str) -> str | None:
+        if not self.crm_encrypted_fields_v1_enabled or operation not in {"read", "update"}:
+            return None
+        tool = self.operation(operation) or {}
+        name = str(tool.get("crmEncryptedFieldsToolName") or "").strip()
+        return name or None
 
     def operation_endpoint(self, operation: str) -> str | None:
         tool = self.operation(operation) or {}
@@ -1019,6 +1122,14 @@ class ConnectedSystemDefinition:
             operation: self.supports(operation) and (operation != "delete" or delete_enabled)
             for operation in ("schema", "read", "create", "update", "delete")
         }
+        # The registry, never a browser-supplied object name, owns the record
+        # type used by each operation. This makes a Person Account create /
+        # Contact read-update lifecycle explicit without exposing record IDs.
+        operation_object_types = {
+            operation: self.object_type_for_operation(operation)
+            for operation, enabled in supported_actions.items()
+            if enabled
+        }
         return {
             "systemId": self.system_id,
             "configurationRevision": self.configuration_revision,
@@ -1029,6 +1140,7 @@ class ConnectedSystemDefinition:
             "status": "connected" if endpoint_configured else "needs_configuration",
             "target": self.target,
             "objectTypeDefault": self.object_type_default,
+            "operationObjectTypes": operation_object_types,
             "transport": self.transport,
             "transportLabel": "External CRM MCP",
             "endpointConfigured": endpoint_configured,
@@ -1048,6 +1160,16 @@ class ConnectedSystemDefinition:
                 ],
                 "primaryObject": self.object_type_default,
                 "version": "crm-operation-contract.v1",
+            },
+            "crmEncryptedFields": {
+                "enabled": self.crm_encrypted_fields_v1_enabled,
+                "profile": (
+                    CRM_ENCRYPTED_FIELDS_V1_PROFILE
+                    if self.crm_encrypted_fields_v1_enabled
+                    else None
+                ),
+                "readReady": self.crm_encrypted_fields_ready("read"),
+                "updateReady": self.crm_encrypted_fields_ready("update"),
             },
         }
 
@@ -1079,12 +1201,14 @@ class ExternalCrmStreamableMcpAdapter:
         tool_catalog: tuple[dict[str, Any], ...] | None = None,
         headers: tuple[tuple[str, str], ...] = (),
         tool_arguments: dict[str, Any] | None = None,
+        replacement_tool_arguments: dict[str, Any] | None = None,
     ):
         self.endpoint = endpoint
         self.timeout_seconds = timeout_seconds
         self.tool_catalog = tuple(tool_catalog or ())
         self.headers = tuple(headers or ())
         self.tool_arguments = _deepcopy_json(tool_arguments or {})
+        self.replacement_tool_arguments = _deepcopy_json(replacement_tool_arguments or {})
         self._demo_record: dict[str, Any] = {
             "Id": "003gK00000jlmaLQAQ",
             "FirstName": "Maria",
@@ -1109,11 +1233,21 @@ class ExternalCrmStreamableMcpAdapter:
             tool_catalog=system.tool_catalog,
             headers=system.transport_headers,
             tool_arguments=system.transport_tool_arguments,
+            replacement_tool_arguments=system.transport_replacement_tool_arguments,
         )
 
     @property
     def configured(self) -> bool:
         return bool(self.endpoint)
+
+    def _tool_arguments_for_call(
+        self, arguments: dict[str, Any], *, replace_tool_arguments: bool
+    ) -> dict[str, Any]:
+        trusted = self.replacement_tool_arguments if replace_tool_arguments else self.tool_arguments
+        return {
+            **_deepcopy_json(trusted),
+            **_deepcopy_json(arguments),
+        }
 
     async def object_schema(self, payload: dict[str, Any]) -> dict[str, Any]:
         return await self._call_tool("object-schema", payload)
@@ -1139,6 +1273,7 @@ class ExternalCrmStreamableMcpAdapter:
         timeout_seconds: float,
         retry_count: int,
         arguments: dict[str, Any],
+        replace_tool_arguments: bool = False,
     ) -> dict[str, Any]:
         # Only idempotent discovery/read operations may retry. Retrying a write
         # without a connector idempotency contract could duplicate a CRM record.
@@ -1151,6 +1286,7 @@ class ExternalCrmStreamableMcpAdapter:
                     arguments,
                     endpoint=endpoint,
                     timeout_seconds=timeout_seconds,
+                    replace_tool_arguments=replace_tool_arguments,
                 )
             except ConnectedSystemsError as error:
                 last_error = error
@@ -1165,6 +1301,7 @@ class ExternalCrmStreamableMcpAdapter:
         *,
         endpoint: str | None = None,
         timeout_seconds: float | None = None,
+        replace_tool_arguments: bool = False,
     ) -> dict[str, Any]:
         resolved_endpoint = endpoint or self.endpoint
         if not resolved_endpoint:
@@ -1179,10 +1316,14 @@ class ExternalCrmStreamableMcpAdapter:
         if resolved_endpoint.startswith("registry://"):
             return self._call_registry_tool(name, arguments)
 
-        tool_arguments = {
-            **_deepcopy_json(self.tool_arguments),
-            **_deepcopy_json(arguments),
-        }
+        # Replacement calls discard ordinary arguments but may retain an
+        # independently registered, server-only connection bundle. This is the
+        # external CRM dynamic-registry boundary: callers can supply an opaque
+        # encrypted envelope, never CRM URLs or credentials.
+        tool_arguments = self._tool_arguments_for_call(
+            arguments,
+            replace_tool_arguments=replace_tool_arguments,
+        )
 
         async def _run() -> dict[str, Any]:
             from mcp.client.session import ClientSession
@@ -1337,6 +1478,16 @@ class ConnectedSystemIntentStore:
     def get_intent(self, *, user_id: str, system_id: str, intent_id: str) -> dict[str, Any] | None:
         raise NotImplementedError
 
+    def get_encrypted_intent_by_client_operation(
+        self,
+        *,
+        user_id: str,
+        system_id: str,
+        delivery_mode: str,
+        client_operation_id: str,
+    ) -> dict[str, Any] | None:
+        raise NotImplementedError
+
     def update_intent(self, *, intent_id: str, updates: dict[str, Any]) -> dict[str, Any]:
         raise NotImplementedError
 
@@ -1400,6 +1551,26 @@ class InMemoryConnectedSystemIntentStore(ConnectedSystemIntentStore):
         if intent.get("user_id") != user_id or intent.get("system_id") != system_id:
             return None
         return _deepcopy_json(intent)
+
+    def get_encrypted_intent_by_client_operation(
+        self,
+        *,
+        user_id: str,
+        system_id: str,
+        delivery_mode: str,
+        client_operation_id: str,
+    ) -> dict[str, Any] | None:
+        return next(
+            (
+                _deepcopy_json(intent)
+                for intent in self.intents.values()
+                if intent.get("user_id") == user_id
+                and intent.get("system_id") == system_id
+                and intent.get("delivery_mode") == delivery_mode
+                and intent.get("client_operation_id") == client_operation_id
+            ),
+            None,
+        )
 
     def claim_pending_intent(self, *, intent_id: str, approval_id: str) -> dict[str, Any]:
         intent = self.intents.get(intent_id)
@@ -1536,6 +1707,12 @@ class DatabaseConnectedSystemIntentStore(ConnectedSystemIntentStore):
               readback_payload_json,
               field_names_json,
               result_payload_json,
+              delivery_mode,
+              encrypted_fields_json,
+              zk_metadata_json,
+              envelope_digest,
+              client_operation_id,
+              approval_challenge_id,
               error_code,
               error_message,
               updated_at
@@ -1554,6 +1731,12 @@ class DatabaseConnectedSystemIntentStore(ConnectedSystemIntentStore):
               :readback_payload_json,
               :field_names_json,
               :result_payload_json,
+              :delivery_mode,
+              :encrypted_fields_json,
+              :zk_metadata_json,
+              :envelope_digest,
+              :client_operation_id,
+              :approval_challenge_id,
               :error_code,
               :error_message,
               NOW()
@@ -1575,6 +1758,31 @@ class DatabaseConnectedSystemIntentStore(ConnectedSystemIntentStore):
             LIMIT 1
             """,
             {"intent_id": intent_id, "user_id": user_id, "system_id": system_id},
+        ).data
+        return _intent_from_db_row(rows[0]) if rows else None
+
+    def get_encrypted_intent_by_client_operation(
+        self,
+        *,
+        user_id: str,
+        system_id: str,
+        delivery_mode: str,
+        client_operation_id: str,
+    ) -> dict[str, Any] | None:
+        rows = self.db.execute_raw(
+            """
+            SELECT * FROM connected_system_intents
+            WHERE user_id = :user_id AND system_id = :system_id
+              AND delivery_mode = :delivery_mode
+              AND client_operation_id = :client_operation_id
+            LIMIT 1
+            """,
+            {
+                "user_id": user_id,
+                "system_id": system_id,
+                "delivery_mode": delivery_mode,
+                "client_operation_id": client_operation_id,
+            },
         ).data
         return _intent_from_db_row(rows[0]) if rows else None
 
@@ -1617,6 +1825,12 @@ class DatabaseConnectedSystemIntentStore(ConnectedSystemIntentStore):
                 result_class = :result_class,
                 result_payload_json = :result_payload_json,
                 readback_result_json = :readback_result_json,
+                delivery_mode = :delivery_mode,
+                encrypted_fields_json = :encrypted_fields_json,
+                zk_metadata_json = :zk_metadata_json,
+                envelope_digest = :envelope_digest,
+                client_operation_id = :client_operation_id,
+                approval_challenge_id = :approval_challenge_id,
                 error_code = :error_code,
                 error_message = :error_message,
                 updated_at = NOW()
@@ -1845,6 +2059,12 @@ def _intent_to_db_params(intent: dict[str, Any]) -> dict[str, Any]:
         "result_class": intent.get("result_class"),
         "result_payload_json": intent.get("result_payload") or {},
         "readback_result_json": intent.get("readback_result") or {},
+        "delivery_mode": intent.get("delivery_mode") or "legacy",
+        "encrypted_fields_json": intent.get("encrypted_fields"),
+        "zk_metadata_json": intent.get("zk_metadata"),
+        "envelope_digest": intent.get("envelope_digest"),
+        "client_operation_id": intent.get("client_operation_id"),
+        "approval_challenge_id": intent.get("approval_challenge_id"),
         "error_code": intent.get("error_code"),
         "error_message": intent.get("error_message"),
     }
@@ -1868,6 +2088,12 @@ def _intent_from_db_row(row: dict[str, Any]) -> dict[str, Any]:
         "result_class": row.get("result_class"),
         "result_payload": _ensure_dict(row.get("result_payload_json")),
         "readback_result": _ensure_dict(row.get("readback_result_json")),
+        "delivery_mode": str(row.get("delivery_mode") or "legacy"),
+        "encrypted_fields": _ensure_dict(row.get("encrypted_fields_json")),
+        "zk_metadata": _ensure_dict(row.get("zk_metadata_json")),
+        "envelope_digest": row.get("envelope_digest"),
+        "client_operation_id": row.get("client_operation_id"),
+        "approval_challenge_id": row.get("approval_challenge_id"),
         "error_code": row.get("error_code"),
         "error_message": row.get("error_message"),
         "created_at": _to_iso(row.get("created_at")),
@@ -1982,10 +2208,23 @@ class ConnectedSystemsService:
         return config
 
     async def _call_operation(
-        self, *, system: ConnectedSystemDefinition, operation: str, payload: dict[str, Any]
+        self,
+        *,
+        system: ConnectedSystemDefinition,
+        operation: str,
+        payload: dict[str, Any],
+        tool_name: str | None = None,
+        replace_tool_arguments: bool = False,
     ) -> dict[str, Any]:
         config = self._require_operation(system, operation)
         adapter = self._adapter_for_system(system)
+        effective_payload = _deepcopy_json(payload)
+        if system.crm_encrypted_fields_v1_enabled and not replace_tool_arguments:
+            # Every MuleSoft connector owns target/connection selection through
+            # connectorRef. Never forward a backend target label as tool input,
+            # including for the current plaintext create/delete compatibility
+            # path.
+            effective_payload.pop("target", None)
         # The production adapter is operation-driven. The narrow legacy fallback
         # keeps injected test adapters compatible while all real registry calls
         # use the mapped tool name and endpoint.
@@ -1997,11 +2236,12 @@ class ConnectedSystemsService:
                 endpoint = str(adapter.endpoint)
             result = await adapter.call_operation(
                 operation=operation,
-                tool_name=str(config.get("name") or ""),
+                tool_name=tool_name or str(config.get("name") or ""),
                 endpoint=endpoint,
                 timeout_seconds=system.timeout_seconds,
                 retry_count=system.retry_count,
-                arguments=payload,
+                arguments=effective_payload,
+                replace_tool_arguments=replace_tool_arguments,
             )
         else:
             legacy_method = {
@@ -2011,7 +2251,7 @@ class ConnectedSystemsService:
                 "update": "update_record",
                 "delete": "delete_record",
             }[operation]
-            result = await getattr(adapter, legacy_method)(payload)
+            result = await getattr(adapter, legacy_method)(effective_payload)
         if result.get("isError"):
             raise ConnectedSystemsError(
                 _mcp_error_message(result),
@@ -2044,6 +2284,439 @@ class ConnectedSystemsService:
     def get_system(self, system_id: str) -> ConnectedSystemDefinition:
         return self._resolve_system(system_id)
 
+    def _require_crm_encrypted_fields_system(
+        self, *, system_id: str, operation: str
+    ) -> ConnectedSystemDefinition:
+        system = self.get_system(system_id)
+        if not system.crm_encrypted_fields_ready(operation):
+            raise ConnectedSystemConfigurationError(
+                "This connected system is not configured for encrypted CRM fields.",
+                code="CONNECTED_SYSTEM_CRM_ENCRYPTED_FIELDS_UNAVAILABLE",
+            )
+        return system
+
+    def crm_encrypted_fields_configuration(self, *, system_id: str) -> dict[str, Any]:
+        system = self._require_crm_encrypted_fields_system(system_id=system_id, operation="read")
+        if not system.crm_encrypted_fields_ready("update"):
+            raise ConnectedSystemConfigurationError(
+                "Encrypted CRM updates are not configured for this connected system.",
+                code="CONNECTED_SYSTEM_CRM_ENCRYPTED_FIELDS_UPDATE_UNAVAILABLE",
+            )
+        key = system.crm_encrypted_fields_recipient_key or {}
+        return {
+            "profile": CRM_ENCRYPTED_FIELDS_V1_PROFILE,
+            "configurationRevision": system.configuration_revision,
+            "recipientKey": {"keyId": key["keyId"], "publicKey": key["publicKey"]},
+            "keyDerivation": "SHA-256(X25519 shared secret)",
+            "aad": False,
+        }
+
+    @staticmethod
+    def _allowed_crm_field_names(
+        *,
+        schema: dict[str, Any],
+        requested: list[str],
+        operation: str,
+        locked_field_names: set[str],
+    ) -> list[str]:
+        """Resolve field names against the current registry-owned schema."""
+        if not isinstance(requested, list) or not requested or len(requested) > 128:
+            raise ConnectedSystemValidationError(
+                "Select one or more CRM fields.",
+                code="CONNECTED_SYSTEM_CRM_FIELD_NAMES_INVALID",
+            )
+        descriptors = [
+            field for field in _ensure_list(schema.get("fields")) if isinstance(field, dict)
+        ]
+        by_any_name: dict[str, dict[str, Any]] = {}
+        for descriptor in descriptors:
+            for candidate in (descriptor.get("key"), descriptor.get("name")):
+                name = _clean_text(candidate, max_length=80)
+                if name:
+                    by_any_name[name] = descriptor
+        resolved: list[str] = []
+        for requested_name in requested:
+            descriptor = by_any_name.get(_clean_text(requested_name, max_length=80))
+            if not descriptor:
+                raise ConnectedSystemValidationError(
+                    "A selected CRM field is not available in the active schema.",
+                    code="CONNECTED_SYSTEM_SCHEMA_FIELD_UNAVAILABLE",
+                )
+            name = _clean_text(descriptor.get("name") or descriptor.get("key"), max_length=80)
+            if not name or name in resolved:
+                raise ConnectedSystemValidationError(
+                    "CRM fields must be unique.",
+                    code="CONNECTED_SYSTEM_CRM_FIELD_NAMES_INVALID",
+                )
+            if operation == "update" and (
+                descriptor.get("readOnly") is True
+                or descriptor.get("identityField") is True
+                or name in locked_field_names
+            ):
+                raise ConnectedSystemValidationError(
+                    "A selected CRM field cannot be updated.",
+                    code="CONNECTED_SYSTEM_SCHEMA_FIELD_READ_ONLY",
+                )
+            resolved.append(name)
+        return resolved
+
+    def _validated_crm_encrypted_fields_envelope(
+        self,
+        *,
+        system: ConnectedSystemDefinition,
+        encrypted_fields: dict[str, Any],
+        direction: Literal["read_request", "read_response", "update_request"],
+    ) -> CrmEncryptedFields:
+        key = system.crm_encrypted_fields_recipient_key or {}
+        try:
+            return validate_crm_encrypted_fields_envelope(
+                encrypted_fields,
+                expected_direction=direction,
+                expected_key_id=str(key.get("keyId") or ""),
+                now_ms=int(time.time() * 1000),
+            )
+        except Exception as error:
+            raise ConnectedSystemValidationError(
+                "The encrypted CRM envelope is invalid or expired.",
+                code="CONNECTED_SYSTEM_CRM_ENCRYPTED_FIELDS_ENVELOPE_INVALID",
+            ) from error
+
+    async def read_bound_record_encrypted_fields(
+        self,
+        *,
+        user_id: str,
+        system_id: str,
+        object_type: str | None,
+        return_fields: list[str],
+        encrypted_fields: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Relay an opaque read for the record already bound to this owner."""
+        system = self._require_crm_encrypted_fields_system(system_id=system_id, operation="read")
+        object_type_value = system.object_type_for_operation("read")
+        record_id = self._require_bound_record_id(
+            user_id=user_id,
+            system_id=system_id,
+            object_type=object_type_value,
+            supplied_record_id=None,
+        )
+        binding = self._store_call(
+            self.store.get_binding,
+            user_id=user_id,
+            system_id=system_id,
+            object_type=object_type_value,
+        )
+        schema = await self.get_schema(
+            system_id=system_id, object_type=object_type_value, require_fresh=True
+        )
+        self._require_schema_action(schema, "read")
+        allowed_return = self._allowed_crm_field_names(
+            schema=schema, operation="read", requested=return_fields, locked_field_names=set()
+        )
+        envelope = self._validated_crm_encrypted_fields_envelope(
+            system=system, encrypted_fields=encrypted_fields, direction="read_request"
+        )
+        result = await self._call_crm_encrypted_fields_partner(
+            system=system,
+            operation="read",
+            payload={
+                "objectType": object_type_value,
+                "id": record_id,
+                "returnFields": allowed_return,
+                "encryptedFields": envelope.mulesoft_payload(),
+            },
+        )
+        payload = _ensure_dict(result.get("payload"))
+        try:
+            total_size = int(payload.get("totalSize") or 0)
+        except (TypeError, ValueError):
+            total_size = -1
+        if total_size < 0 or total_size > 1:
+            raise ConnectedSystemBlockedError(
+                "The encrypted CRM lookup did not resolve exactly one safe result.",
+                code="CONNECTED_SYSTEM_RECORD_MATCH_AMBIGUOUS",
+                status_code=409,
+            )
+        response_fields = payload.get("encryptedFields")
+        if not isinstance(response_fields, dict):
+            raise ConnectedSystemConfigurationError(
+                "The CRM partner returned no encrypted field response.",
+                code="CONNECTED_SYSTEM_CRM_ENCRYPTED_FIELDS_RESPONSE_INVALID",
+                status_code=502,
+            )
+        try:
+            response_envelope = envelope.with_mulesoft_response(response_fields)
+        except (ValueError, TypeError) as error:
+            raise ConnectedSystemConfigurationError(
+                "The CRM partner returned an invalid encrypted field response.",
+                code="CONNECTED_SYSTEM_CRM_ENCRYPTED_FIELDS_RESPONSE_INVALID",
+                status_code=502,
+            ) from error
+        if (
+            response_envelope.client_operation_id != envelope.client_operation_id
+            or response_envelope.client_public_key != envelope.client_public_key
+        ):
+            raise ConnectedSystemConfigurationError(
+                "The encrypted CRM response does not match this request.",
+                code="CONNECTED_SYSTEM_CRM_ENCRYPTED_FIELDS_RESPONSE_INVALID",
+                status_code=502,
+            )
+        returned_record_id = _clean_text(
+            payload.get("recordId") or payload.get("id"), max_length=128
+        )
+        if returned_record_id and returned_record_id != record_id:
+            raise ConnectedSystemConfigurationError(
+                "The CRM partner returned a different record than the owner binding.",
+                code="CONNECTED_SYSTEM_BOUND_RECORD_MISMATCH",
+                status_code=502,
+            )
+        response_status = str(payload.get("status") or "succeeded").strip().lower()
+        if response_status not in {"success", "succeeded"}:
+            raise ConnectedSystemConfigurationError(
+                "The CRM partner returned an invalid read status.",
+                code="CONNECTED_SYSTEM_CRM_ENCRYPTED_FIELDS_RESPONSE_INVALID",
+                status_code=502,
+            )
+        self._audit(
+            user_id=user_id,
+            system_id=system_id,
+            action="read",
+            object_type=object_type_value,
+            record_id=record_id,
+            field_names=allowed_return,
+            mcp_result_class="succeeded",
+            readback_result_class="encrypted_response_returned",
+            status="succeeded",
+            metadata={"profile": CRM_ENCRYPTED_FIELDS_V1_PROFILE, "total_size": total_size},
+        )
+        return {
+            "profile": CRM_ENCRYPTED_FIELDS_V1_PROFILE,
+            "systemId": system_id,
+            "objectType": object_type_value,
+            "status": response_status,
+            "totalSize": total_size,
+            "recordId": record_id,
+            "bindingStatus": "active",
+            "binding": self._public_binding(binding),
+            "encryptedFields": response_envelope.model_dump(mode="json", by_alias=True),
+        }
+
+    async def create_encrypted_fields_update_intent(
+        self,
+        *,
+        user_id: str,
+        system_id: str,
+        object_type: str | None,
+        field_names: list[str],
+        encrypted_fields: dict[str, Any],
+        locked_field_names: set[str],
+    ) -> dict[str, Any]:
+        system = self._require_crm_encrypted_fields_system(system_id=system_id, operation="update")
+        object_type_value = system.object_type_for_operation("update")
+        record_id = self._require_bound_record_id(
+            user_id=user_id,
+            system_id=system_id,
+            object_type=object_type_value,
+            supplied_record_id=None,
+        )
+        schema = await self.get_schema(
+            system_id=system_id, object_type=object_type_value, require_fresh=True
+        )
+        self._require_schema_action(schema, "update")
+        allowed_fields = self._allowed_crm_field_names(
+            schema=schema,
+            operation="update",
+            requested=field_names,
+            locked_field_names=locked_field_names,
+        )
+        envelope = self._validated_crm_encrypted_fields_envelope(
+            system=system, encrypted_fields=encrypted_fields, direction="update_request"
+        )
+        existing = self._store_call(
+            self.store.get_encrypted_intent_by_client_operation,
+            user_id=user_id,
+            system_id=system_id,
+            delivery_mode=CRM_ENCRYPTED_FIELDS_V1_PROFILE,
+            client_operation_id=envelope.client_operation_id,
+        )
+        if existing:
+            if existing.get("delivery_mode") != CRM_ENCRYPTED_FIELDS_V1_PROFILE:
+                raise ConnectedSystemValidationError(
+                    "The encrypted CRM operation id is already in use.",
+                    code="CONNECTED_SYSTEM_CRM_ENCRYPTED_FIELDS_REPLAYED",
+                )
+            return self._public_intent(existing)
+        return self._create_intent(
+            user_id=user_id,
+            system=system,
+            action="update",
+            object_type=object_type_value,
+            request_payload={},
+            readback_payload={},
+            field_names=allowed_fields,
+            record_id=record_id,
+            delivery_mode=CRM_ENCRYPTED_FIELDS_V1_PROFILE,
+            encrypted_fields=envelope.model_dump(mode="json", by_alias=True),
+            zk_metadata={
+                "profile": CRM_ENCRYPTED_FIELDS_V1_PROFILE,
+                "recipientKeyId": envelope.recipient_key_id,
+                "configurationRevision": system.configuration_revision,
+                "expiresAtMs": envelope.expires_at_ms,
+            },
+            envelope_digest=envelope.digest(),
+            client_operation_id=envelope.client_operation_id,
+        )
+
+    async def approve_encrypted_fields_intent(
+        self, *, user_id: str, system_id: str, intent_id: str
+    ) -> dict[str, Any]:
+        system = self._require_crm_encrypted_fields_system(system_id=system_id, operation="update")
+        existing = self._store_call(
+            self.store.get_intent, user_id=user_id, system_id=system_id, intent_id=intent_id
+        )
+        if not existing:
+            raise ConnectedSystemNotFoundError("CRM intent was not found.")
+        if existing.get("delivery_mode") != CRM_ENCRYPTED_FIELDS_V1_PROFILE:
+            raise ConnectedSystemValidationError(
+                "This approval route accepts only encrypted CRM intents.",
+                code="CONNECTED_SYSTEM_CRM_ENCRYPTED_FIELDS_INTENT_REQUIRED",
+            )
+        if existing.get("status") in TERMINAL_INTENT_STATUSES:
+            return self._public_intent(existing)
+        if existing.get("status") == "pending":
+            approval = _approval_id()
+            intent = self._store_call(
+                self.store.claim_pending_intent, intent_id=intent_id, approval_id=approval
+            )
+        elif existing.get("status") == "approved" and existing.get("approval_id"):
+            approval = str(existing["approval_id"])
+            intent = existing
+        else:
+            return self._public_intent(existing)
+        if intent.get("approval_id") != approval:
+            return self._public_intent(intent)
+        partner_attempted = False
+        try:
+            record_id = self._require_bound_record_id(
+                user_id=user_id,
+                system_id=system_id,
+                object_type=str(intent.get("object_type") or ""),
+                supplied_record_id=str(intent.get("record_id") or ""),
+            )
+            metadata = _ensure_dict(intent.get("zk_metadata"))
+            if metadata.get("configurationRevision") != system.configuration_revision:
+                raise ConnectedSystemValidationError(
+                    "The CRM connector changed. Review and submit a fresh update.",
+                    code="CONNECTED_SYSTEM_CRM_ENCRYPTED_FIELDS_CONFIGURATION_STALE",
+                )
+            envelope = self._validated_crm_encrypted_fields_envelope(
+                system=system,
+                encrypted_fields=_ensure_dict(intent.get("encrypted_fields")),
+                direction="update_request",
+            )
+            schema = await self.get_schema(
+                system_id=system_id,
+                object_type=str(intent.get("object_type") or ""),
+                require_fresh=True,
+            )
+            self._require_schema_action(schema, "update")
+            partner_attempted = True
+            result = await self._call_crm_encrypted_fields_partner(
+                system=system,
+                operation="update",
+                payload={
+                    "objectType": intent["object_type"],
+                    "id": record_id,
+                    "encryptedFields": envelope.mulesoft_payload(),
+                },
+            )
+            normalized_ack = _normalize_crm_encrypted_fields_ack(result.get("payload"))
+            updated = self._store_call(
+                self.store.update_intent,
+                intent_id=intent_id,
+                updates={
+                    "status": "succeeded",
+                    "approval_id": approval,
+                    "result_class": "succeeded",
+                    "result_payload": normalized_ack,
+                    "readback_result": {"resultClass": "metadata_acknowledged"},
+                    "error_code": None,
+                    "error_message": None,
+                },
+            )
+            self._audit_for_intent(
+                updated,
+                mcp_result_class="succeeded",
+                readback_result_class="metadata_acknowledged",
+                status="succeeded",
+                metadata={"profile": CRM_ENCRYPTED_FIELDS_V1_PROFILE},
+            )
+            return self._public_intent(updated)
+        except Exception as error:
+            updated = self._store_call(
+                self.store.update_intent,
+                intent_id=intent_id,
+                updates={
+                    "status": "approved" if partner_attempted else "failed",
+                    "approval_id": approval,
+                    "error_code": getattr(
+                        error, "code", "CONNECTED_SYSTEM_CRM_ENCRYPTED_FIELDS_APPROVAL_FAILED"
+                    ),
+                    "error_message": "Encrypted CRM approval could not be completed.",
+                },
+            )
+            self._audit_for_intent(
+                updated,
+                mcp_result_class="failed",
+                readback_result_class=None,
+                status="retry_pending" if partner_attempted else "failed",
+                metadata={
+                    "profile": CRM_ENCRYPTED_FIELDS_V1_PROFILE,
+                    "error_code": updated.get("error_code"),
+                },
+            )
+            if isinstance(error, ConnectedSystemsError):
+                raise
+            raise ConnectedSystemsError(
+                "Encrypted CRM approval failed.",
+                code="CONNECTED_SYSTEM_CRM_ENCRYPTED_FIELDS_APPROVAL_FAILED",
+            ) from error
+
+    async def _call_crm_encrypted_fields_partner(
+        self,
+        *,
+        system: ConnectedSystemDefinition,
+        operation: Literal["read", "update"],
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Call the registered encrypted tool with only server-owned connection state."""
+        tool_name = system.crm_encrypted_fields_tool_name(operation)
+        if not tool_name:
+            raise ConnectedSystemConfigurationError(
+                "Encrypted CRM partner routing is not configured.",
+                code="CONNECTED_SYSTEM_CRM_ENCRYPTED_FIELDS_UNAVAILABLE",
+            )
+        try:
+            result = await self._call_operation(
+                system=system,
+                operation=operation,
+                payload=payload,
+                tool_name=tool_name,
+                replace_tool_arguments=True,
+            )
+            if bool(result.get("isError")):
+                raise ConnectedSystemsError(
+                    "Encrypted CRM partner request failed.",
+                    code="CONNECTED_SYSTEM_CRM_ENCRYPTED_FIELDS_PARTNER_FAILED",
+                    status_code=502,
+                )
+            return result
+        except ConnectedSystemsError as error:
+            raise ConnectedSystemsError(
+                "Encrypted CRM partner request failed.",
+                code="CONNECTED_SYSTEM_CRM_ENCRYPTED_FIELDS_PARTNER_FAILED",
+                status_code=502,
+            ) from error
+
     def list_record_binding_statuses(self, *, user_id: str) -> dict[str, Any]:
         """Return safe owner-scoped binding states without CRM ids or values."""
         active = self._store_call(self.store.list_bindings, user_id=user_id)
@@ -2054,7 +2727,13 @@ class ConnectedSystemsService:
         statuses: list[dict[str, Any]] = []
         for summary in self.list_systems():
             system_id = str(summary.get("systemId") or "")
-            object_type = str(summary.get("objectTypeDefault") or "")
+            operation_object_types = _ensure_dict(summary.get("operationObjectTypes"))
+            # Setup readiness follows the record type that powers the durable
+            # read/update experience. A Person Account create binding is not a
+            # substitute for the Contact binding used by those operations.
+            object_type = str(
+                operation_object_types.get("read") or summary.get("objectTypeDefault") or ""
+            )
             binding = indexed.get((system_id, object_type))
             statuses.append(
                 {
@@ -2512,6 +3191,7 @@ class ConnectedSystemsService:
                 if (
                     field.get("required")
                     and field.get("identityField") is not True
+                    and field.get("defaultedOnCreate") is not True
                     and str(field["name"]).lower() not in supplied
                 )
             ]
@@ -2535,8 +3215,9 @@ class ConnectedSystemsService:
     ) -> dict[str, Any]:
         system = self.get_system(system_id)
         self._require_operation(system, "create")
+        operation_object_type = system.object_type_for_operation("create")
         schema = await self.get_schema(
-            system_id=system_id, object_type=object_type, require_fresh=True
+            system_id=system_id, object_type=operation_object_type, require_fresh=True
         )
         self._require_schema_action(schema, "create")
         fields = {str(field["key"]): field for field in schema["fields"]}
@@ -2705,8 +3386,13 @@ class ConnectedSystemsService:
         locked_field_names: set[str] | None = None,
     ) -> dict[str, Any]:
         system = self.get_system(system_id)
+        if system.crm_encrypted_fields_v1_enabled:
+            raise ConnectedSystemBlockedError(
+                "This CRM requires its configured encrypted update protocol.",
+                code="CONNECTED_SYSTEM_ENCRYPTED_FIELDS_UPDATE_REQUIRED",
+            )
         self._require_operation(system, "update")
-        object_type_value = _normalize_object_type(object_type, default=system.object_type_default)
+        object_type_value = system.object_type_for_operation("update")
         record_id_value = self._require_bound_record_id(
             user_id=user_id,
             system_id=system_id,
@@ -2714,7 +3400,7 @@ class ConnectedSystemsService:
             supplied_record_id=record_id,
         )
         schema = await self.get_schema(
-            system_id=system_id, object_type=object_type, require_fresh=True
+            system_id=system_id, object_type=object_type_value, require_fresh=True
         )
         self._require_schema_action(schema, "update")
         fields = {str(field["key"]): field for field in schema["fields"]}
@@ -2960,7 +3646,12 @@ class ConnectedSystemsService:
         return_fields: list[str] | None = None,
     ) -> dict[str, Any]:
         system = self.get_system(system_id)
-        object_type_value = _normalize_object_type(object_type, default=system.object_type_default)
+        if system.crm_encrypted_fields_v1_enabled:
+            raise ConnectedSystemBlockedError(
+                "This CRM requires its configured encrypted read protocol.",
+                code="CONNECTED_SYSTEM_ENCRYPTED_FIELDS_READ_REQUIRED",
+            )
+        object_type_value = system.object_type_for_operation("read")
         record_id = self._require_bound_record_id(
             user_id=user_id,
             system_id=system_id,
@@ -3073,6 +3764,8 @@ class ConnectedSystemsService:
         force_refresh: bool = False,
     ) -> dict[str, Any]:
         """Find a record using only the authenticated owner's verified identity."""
+        system = self.get_system(system_id)
+        object_type = system.object_type_for_operation("read")
         profile = await self._verified_user_crm_profile(user_id=user_id)
         return await self.search_record(
             user_id=user_id,
@@ -3201,6 +3894,22 @@ class ConnectedSystemsService:
                     "last_intent_id": None,
                 },
             )
+        if system.crm_encrypted_fields_v1_enabled:
+            # Verified-identity discovery remains a deliberately narrow
+            # server-side exception. An encrypted-fields connector never
+            # receives plaintext
+            # CRM fields on this route; the browser must issue a fresh bound
+            # encrypted-fields read after it receives binding metadata.
+            return {
+                "systemId": system_id,
+                "target": system.target,
+                "objectType": object_type_value,
+                "resultClass": read.get("resultClass"),
+                "recordId": record_id or None,
+                "servedFromBinding": False,
+                "bindingStatus": "active" if binding else "unbound",
+                "binding": self._public_binding(binding) if binding else None,
+            }
         return {
             **read,
             "servedFromBinding": False,
@@ -3386,6 +4095,11 @@ class ConnectedSystemsService:
         )
         if not existing:
             raise ConnectedSystemNotFoundError("CRM intent was not found.")
+        if str(existing.get("delivery_mode") or "legacy") != "legacy":
+            raise ConnectedSystemValidationError(
+                "This approval route accepts only standard CRM intents.",
+                code="CONNECTED_SYSTEM_LEGACY_INTENT_REQUIRED",
+            )
         if existing.get("status") in TERMINAL_INTENT_STATUSES:
             # Retry-safe: callers receive the stored terminal result and never
             # cause a second MCP mutation.
@@ -3607,6 +4321,11 @@ class ConnectedSystemsService:
         readback_payload: dict[str, Any],
         field_names: list[str],
         record_id: str | None,
+        delivery_mode: str = "legacy",
+        encrypted_fields: dict[str, Any] | None = None,
+        zk_metadata: dict[str, Any] | None = None,
+        envelope_digest: str | None = None,
+        client_operation_id: str | None = None,
     ) -> dict[str, Any]:
         deduped_fields = list(dict.fromkeys(field_names))
         intent = {
@@ -3625,6 +4344,12 @@ class ConnectedSystemsService:
             "result_class": None,
             "result_payload": {},
             "readback_result": {},
+            "delivery_mode": delivery_mode,
+            "encrypted_fields": _deepcopy_json(encrypted_fields) if encrypted_fields else None,
+            "zk_metadata": _deepcopy_json(zk_metadata) if zk_metadata else None,
+            "envelope_digest": envelope_digest,
+            "client_operation_id": client_operation_id,
+            "approval_challenge_id": None,
             "error_code": None,
             "error_message": None,
             "created_at": _now_iso(),
@@ -3791,6 +4516,8 @@ class ConnectedSystemsService:
             "status": intent["status"],
             "recordId": intent.get("record_id"),
             "approvalId": intent.get("approval_id"),
+            "deliveryMode": intent.get("delivery_mode") or "legacy",
+            "envelopeDigest": intent.get("envelope_digest"),
             "fieldNames": intent.get("field_names") or [],
             "payloadSummary": _payload_summary(intent),
             "resultClass": intent.get("result_class"),
@@ -3842,6 +4569,11 @@ class ConnectedSystemsService:
 
 
 def _payload_summary(intent: dict[str, Any]) -> dict[str, Any]:
+    if intent.get("delivery_mode") == CRM_ENCRYPTED_FIELDS_V1_PROFILE:
+        return {
+            "profile": CRM_ENCRYPTED_FIELDS_V1_PROFILE,
+            "fieldNames": intent.get("field_names") or [],
+        }
     payload = intent.get("request_payload") or {}
     summary = {
         "target": payload.get("target"),

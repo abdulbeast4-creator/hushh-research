@@ -94,18 +94,23 @@ export const ROUTES = {
   PROFILE_PKM_AGENT_LAB: "/one/profile/pkm-agent-lab",
   PROFILE_RECEIPTS: "/one/profile/receipts",
   PROFILE_GMAIL_OAUTH_RETURN: "/one/profile/gmail/oauth/return",
+  /** Compatibility redirect only; Calendar now has its own agent workspace. */
+  PROFILE_INTEGRATIONS: "/one/profile/integrations",
+  PROFILE_GOOGLE_OAUTH_RETURN: "/one/profile/google/oauth/return",
   OAUTH_AUTHORIZE: "/oauth/authorize",
   ONE_SETUP: "/one/setup",
   ONE_SETUP_FINANCE: "/one/setup/finance",
   ONE_SETUP_FINANCE_IMPORT: "/one/setup/finance/import",
   ONE_SETUP_KAI: "/one/setup/kai",
   ONE_SETUP_GMAIL: "/one/setup/gmail",
+  ONE_SETUP_CALENDAR: "/one/setup/calendar",
   ONE_SETUP_LOCATION: "/one/setup/location",
   ONE_SETUP_EMAIL: "/one/setup/email",
   ONE_SETUP_RIA: "/one/setup/ria",
   ONE_SETUP_CONNECTED_SYSTEMS: "/one/setup/connected-systems",
   ONE_SETUP_CONNECTIONS: "/one/setup/connections",
   GMAIL: "/one/gmail",
+  CALENDAR: "/one/calendar",
   PKM: "/one/pkm",
   ONE_MARKETPLACE: "/one/marketplace",
   /** Owner setup and management for the Apple Wallet profile pass. */
@@ -127,6 +132,13 @@ export const ROUTES = {
   ONE_LOCATION: "/one/location",
   /** Immersive, consented multi-person Location map. */
   ONE_LOCATION_MAP: "/one/location/map",
+  /**
+   * Nearby check-in. Its own destination, not a drawer over the map: the map
+   * shows people who already share with you, while check-in makes you briefly
+   * discoverable to opted-in people at a place. They were one screen and read
+   * as the same feature.
+   */
+  ONE_LOCATION_CHECK_IN: "/one/location/check-in",
   LEGACY_GMAIL: "/gmail",
   LEGACY_PKM: "/pkm",
   LEGACY_CONNECTED_SYSTEMS: "/connected-systems",
@@ -240,6 +252,7 @@ export function buildOneSetupCapabilityFinishRoute(
 /** Static setup workspaces. This is intentionally exact rather than a prefix. */
 export const SETUP_CAPABILITY_ROUTES: Readonly<Record<string, string>> = {
   gmail: ROUTES.ONE_SETUP_GMAIL,
+  calendar: ROUTES.ONE_SETUP_CALENDAR,
   location: ROUTES.ONE_SETUP_LOCATION,
   email: ROUTES.ONE_SETUP_EMAIL,
   finance: ROUTES.ONE_SETUP_FINANCE,
@@ -261,6 +274,7 @@ export const SETUP_NAVIGATION_ROUTES: readonly string[] = [
 export const CAPABILITY_HANDOFF_TARGETS: Readonly<Record<string, string>> = {
   finance: ROUTES.KAI_HOME,
   gmail: ROUTES.GMAIL,
+  calendar: ROUTES.CALENDAR,
   email: ROUTES.ONE_KYC,
   location: ROUTES.ONE_LOCATION,
   ria: ROUTES.RIA_ONBOARDING,
@@ -341,6 +355,7 @@ export const CAPABILITY_ONBOARDING_ROUTE_PREFIXES: Readonly<
     ROUTES.KAI_PLAID_OAUTH_RETURN,
   ],
   gmail: [ROUTES.ONE_SETUP_GMAIL, ROUTES.PROFILE_GMAIL_OAUTH_RETURN],
+  calendar: [ROUTES.ONE_SETUP_CALENDAR, ROUTES.PROFILE_GOOGLE_OAUTH_RETURN],
   email: [ROUTES.ONE_SETUP_EMAIL],
   location: [ROUTES.ONE_SETUP_LOCATION],
   // RIA_CLAIM belongs to the ria capability: recognising an adviser from their

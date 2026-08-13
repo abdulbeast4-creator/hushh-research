@@ -46,7 +46,7 @@ import {
   TaskFlowHeader,
   TrustNoteCard,
 } from "@/components/one-location/redesign/primitives";
-import { MUTED_TEXT, SECTION_HEADING } from "@/components/one-location/redesign/tokens";
+import { MUTED_TEXT, SECTION_TITLE } from "@/components/one-location/redesign/tokens";
 import type {
   OneLocationCircleDetail,
   OneLocationCircleEligibleConnection,
@@ -74,6 +74,25 @@ function circleKindLabel(kind: OneLocationCircleKind): string {
   if (kind === "family") return "Family";
   if (kind === "friends") return "Friends";
   return "Other";
+}
+
+/**
+ * Subtitle for the "Your circles" list row, e.g. "Friends · 2 members".
+ *
+ * Counts OTHER members (everyone except the viewer) so it matches the Circle
+ * Detail subtitle, which filters out the current user. The backend
+ * `memberCount` includes the viewer — always a member of a circle shown in
+ * their own list — so subtracting one yields the same number both places.
+ * `Math.max(0, ...)` guards a transient zero.
+ */
+function circleListMemberCountLabel(
+  kind: OneLocationCircleKind,
+  memberCount: number,
+): string {
+  const others = Math.max(0, memberCount - 1);
+  return `${circleKindLabel(kind)} · ${others} ${
+    others === 1 ? "member" : "members"
+  }`;
 }
 
 function circleFlowErrorMessage(error: unknown, fallback: string): string {
@@ -169,7 +188,7 @@ export function CirclesSection({
     <div className="space-y-3" data-testid="one-location-named-circles">
       <div className="flex items-center justify-between gap-3 px-1">
         <div>
-          <h2 className={SECTION_HEADING}>
+          <h2 className={SECTION_TITLE}>
             Your circles
           </h2>
           <p className={cn(MUTED_TEXT, "mt-1")}>
@@ -309,9 +328,10 @@ export function CirclesSection({
                 </span>
               }
               title={circle.name}
-              description={`${circleKindLabel(circle.kind)} · ${circle.memberCount} ${
-                circle.memberCount === 1 ? "member" : "members"
-              }`}
+              description={circleListMemberCountLabel(
+                circle.kind,
+                circle.memberCount,
+              )}
               trailing={circle.role === "owner" ? "Owner" : "Member"}
               chevron
               onClick={() => onOpen(circle.id)}
@@ -837,6 +857,18 @@ export function CircleDetailFlow({
     circle?.inviteCodeNeedsOwnerRotation,
   );
   const members = useMemo(() => circle?.members ?? [], [circle?.members]);
+  // Single source of truth for the member count shown on BOTH the "Your
+  // circles" list row and this detail subtitle: the number of OTHER people in
+  // the circle (everyone except the viewer). `circle.memberCount` from the
+  // backend includes the viewer, so the list row subtracts one; here we filter
+  // the loaded members by the current user id, which yields the same number.
+  // Excluding only the current user (not the owner role) keeps the two views
+  // in agreement for members viewing a circle they do not own.
+  const externalMembersCount = useMemo(
+    () => members.filter((member) => member.userId !== currentUserId).length,
+    [members, currentUserId],
+  );
+
   const filteredEligibleConnections = useMemo(() => {
     const query = peopleSearch.trim().toLocaleLowerCase();
     if (!query) return eligibleConnections;
@@ -1017,7 +1049,9 @@ export function CircleDetailFlow({
         title={circle?.name ?? "Circle"}
         description={
           circle
-            ? `${circleKindLabel(circle.kind)} · ${circle.memberCount} members`
+            ? `${circleKindLabel(circle.kind)} · ${externalMembersCount} ${
+                externalMembersCount === 1 ? "member" : "members"
+              }`
             : "Loading Circle…"
         }
       />

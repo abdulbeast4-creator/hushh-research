@@ -3,6 +3,7 @@ from unittest.mock import patch
 
 import pytest
 
+from hushh_mcp.services.connection_graph_service import ORIGIN_DIRECT_REQUEST
 from hushh_mcp.services.connections_service import (
     _RIA_ACTIVE_PICKS_CAPABILITY,
     ConnectionsError,
@@ -1075,3 +1076,146 @@ def test_resolve_pending_scope_proposals_declines_all_and_audits():
     assert [e["proposal_id"] for e in events] == ["p1", "p2"]
     assert {e["event_type"] for e in events} == {"DECLINED"}
     assert {e["reason"] for e in events} == {"connection_rejected"}
+
+
+def test_accept_records_the_direct_request_origin_location_needs():
+    """Accepting must materialize Location eligibility, not just Connect's row.
+
+    Connect lists anyone with an active `connections` row. Location requires
+    that AND an active non-circle `connection_origins` row. Acceptance wrote
+    only the first, so a person could be connected in Connect and absent from
+    Location's recipient list -- One answering "nobody in your connections
+    matches that name" about someone plainly there, and "connect with X then
+    share my location with X" breaking at a step that looked successful.
+
+    The origin has to be written on the transaction connection, inside the same
+    transaction that activates the connection, or the two can disagree.
+    """
+    svc = _svc()
+    events: list = []
+    db = _TransactionalDB(
+        [
+            [
+                {
+                    "id": "req-1",
+                    "requester_user_id": "user-a",
+                    "addressee_user_id": "user-b",
+                    "status": "pending",
+                }
+            ],
+            [],  # no scope proposals
+            [{"id": "conn-1"}],
+            [{"id": "tc-1"}],
+            [{"id": "tc-2"}],
+            [{"id": "req-1"}],
+        ],
+        events,
+    )
+
+    recorded: list[dict] = []
+
+    def _capture_origin(conn, **kwargs):
+        recorded.append({"conn": conn, **kwargs})
+        return {"origin_kind": kwargs.get("kind")}
+
+    with (
+        patch("hushh_mcp.services.connections_service.get_db", lambda: db),
+        patch(
+            "hushh_mcp.services.connections_service.ensure_connection_origin",
+            _capture_origin,
+        ),
+    ):
+        out = svc.accept_request("user-b", "req-1")
+
+    assert out["status"] == "accepted"
+    assert len(recorded) == 1, "acceptance must record exactly one origin"
+    origin = recorded[0]
+    # `direct_request`, never a circle kind: Location's eligibility query
+    # excludes circle-derived origins, so recording one of those would leave
+    # the same invisible-recipient bug in place while looking fixed.
+    assert origin["kind"] == ORIGIN_DIRECT_REQUEST
+    assert {origin["user_a_id"], origin["user_b_id"]} == {"user-a", "user-b"}
+    # Traceable back to the request that authorized it.
+    assert origin["source_ref"] == "req-1"
+    # On the TRANSACTION's connection, so it commits or rolls back with the
+    # connection row rather than landing independently.
+    assert origin["conn"] is db.connection
+
+
+# The pair from the live failure. Not invented: accepting Abdul Rashid's
+# request returned 500 three times, and these are the two real Firebase UIDs.
+_UPPER_FIRST = "RPNmQAmVdlNz84GVfXxta50wnYx1"
+_LOWER_FIRST = "oGltkj09rMcRnru7sBvfziC94px1"
+
+
+def test_python_orders_this_pair_the_way_the_database_will_reject():
+    """The disagreement, pinned so the fix cannot be "simplified" back.
+
+    `connections` declares CHECK (user_a_id < user_b_id), and that `<` is
+    Postgres's, under the database collation (en_US.UTF8), which compares
+    case-insensitively at the primary level. Python's `<` is bytewise, so every
+    uppercase letter sorts before every lowercase one.
+
+    Ordering in Python and inserting the result produced CheckViolation, so
+    accepting a connection failed whenever two UIDs differed in case at the
+    first distinguishing character. Measured on UAT: 88 of 390 pending requests
+    could never have been accepted, and the route logged nothing, so the only
+    symptom was "That didn't go through. Try again."
+
+    The survivorship trap is worth knowing: every row in `connections` agrees
+    with Python's ordering, which reads as proof the code is fine. It is the
+    opposite -- disagreeing pairs were refused at INSERT, so they were never
+    written.
+    """
+    svc = _svc()
+
+    # Python puts the uppercase-leading id first. Postgres does not, which is
+    # why this ordering must never reach an INSERT.
+    assert svc._canonical_pair(_UPPER_FIRST, _LOWER_FIRST) == (
+        _UPPER_FIRST,
+        _LOWER_FIRST,
+    )
+
+
+def test_every_connections_writer_lets_the_database_order_the_pair():
+    """Ordering happens in the statement the constraint judges -- in all three.
+
+    Reads are order-agnostic: every one matches
+    `user_a_id = :id OR user_b_id = :id`, so existing rows stay findable
+    whichever way round they were stored. Only the INSERTs must satisfy
+    `connections_canonical_order`.
+
+    There are three, and the third is easy to miss -- `ConnectionGraphService`
+    writes the same table through its own `canonical_pair`, carrying the
+    identical Python-ordering bug. Fixing only the two in `connections_service`
+    would have left circle-invite and origin materialisation failing the same
+    way, for the same reason, with the same silent 500.
+    """
+    import inspect
+    import re
+
+    from hushh_mcp.services import connection_graph_service, connections_service
+
+    writers = []
+    for module in (connections_service, connection_graph_service):
+        source = inspect.getsource(module)
+        for match in re.finditer(r"INSERT INTO connections\s*\(", source):
+            # The VALUES clause belonging to this INSERT.
+            tail = source[match.end() : match.end() + 600]
+            writers.append((module.__name__, tail))
+
+    assert len(writers) == 3, f"expected 3 connections writers, found {len(writers)}"
+
+    for module_name, tail in writers:
+        values = tail[tail.index("VALUES") :] if "VALUES" in tail else ""
+        assert "LEAST(" in values and "GREATEST(" in values, (
+            f"{module_name}: a connections INSERT orders its pair outside SQL. "
+            "Python's `<` is bytewise and disagrees with the en_US.UTF8 "
+            "collation the CHECK uses, which is the CheckViolation this guards."
+        )
+
+    # The Python helpers survive for other callers, but nothing may use one to
+    # choose the columns of a row the CHECK will judge.
+    service_source = inspect.getsource(connections_service)
+    assert "self._canonical_pair(requester, user_id)" not in service_source
+    assert "self._canonical_pair(user_id, peer_user_id)" not in service_source

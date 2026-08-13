@@ -183,6 +183,24 @@ export class OneLocationService {
     });
   }
 
+  /**
+   * Fetch only the canonical Location-sharing recipients.
+   *
+   * The workspace state contains several independent Location projections and
+   * can still be loading when a voice journey reaches the mounted screen.
+   * Recipient selection must not turn that loading window into a false
+   * "nobody matches" result.
+   */
+  static async listRecipients(
+    vaultOwnerToken: string,
+  ): Promise<OneLocationRecipient[]> {
+    const response = await apiJson<{ recipients: OneLocationRecipient[] }>(
+      "/api/one/location/recipients",
+      { headers: authHeaders(vaultOwnerToken) },
+    );
+    return response.recipients ?? [];
+  }
+
   static async listCircles(
     vaultOwnerToken: string,
   ): Promise<OneLocationCircleSummary[]> {
@@ -215,6 +233,51 @@ export class OneLocationService {
         method: "POST",
         headers: jsonAuthHeaders(params.vaultOwnerToken),
         body: JSON.stringify({ name: params.name, kind: params.kind }),
+      },
+    );
+    return response.circle;
+  }
+
+  /**
+   * Find-or-create the caller's first Circle and return its live code.
+   *
+   * Takes a Firebase ID token rather than a vault owner token, because
+   * onboarding runs before the vault exists — the vault is only introduced once
+   * the /one/setup wizard finishes. Every other Circle call here stays
+   * vault-gated; this is the single pre-vault entry point, and it can only ever
+   * act on a Circle the caller owns.
+   */
+  static async bootstrapOnboardingCircle(params: {
+    idToken: string;
+    name: string;
+  }): Promise<{ circleId: string; circleName: string; code: string }> {
+    const response = await apiJson<{
+      invite: { circleId: string; circleName: string; code: string };
+    }>("/api/one/location/circles/bootstrap", {
+      method: "POST",
+      headers: jsonAuthHeaders(params.idToken),
+      body: JSON.stringify({ name: params.name }),
+    });
+    return response.invite;
+  }
+
+  /**
+   * Show what a circle code points at, before joining it.
+   *
+   * Firebase-authenticated like the bootstrap call, because someone who was
+   * handed a code meets it mid-setup, before any vault exists -- which is
+   * precisely the person the vault-gated resolve route would turn away.
+   */
+  static async previewOnboardingCircleCode(params: {
+    idToken: string;
+    code: string;
+  }): Promise<OneLocationCircleInvitePreview> {
+    const response = await apiJson<{ circle: OneLocationCircleInvitePreview }>(
+      "/api/one/location/circle-codes/preview",
+      {
+        method: "POST",
+        headers: jsonAuthHeaders(params.idToken),
+        body: JSON.stringify({ code: params.code }),
       },
     );
     return response.circle;
@@ -495,7 +558,29 @@ export class OneLocationService {
     return response.preferences;
   }
 
+  /**
+   * Persist the "Auto-share my location" toggle server-side and reconcile
+   * auto-created shares. ON fans out an auto-share grant to every
+   * location-eligible, key-ready peer; OFF tears down only the auto-created
+   * shares and leaves manual shares untouched. Reversible and idempotent.
+   */
+  static async setAutoShare(params: {
+    vaultOwnerToken: string;
+    enabled: boolean;
+  }): Promise<{
+    autoShareEnabled: boolean;
+    action: "fan_out" | "teardown";
+    affectedShareCount: number;
+  }> {
+    return apiJson("/api/one/location/auto-share", {
+      method: "POST",
+      headers: jsonAuthHeaders(params.vaultOwnerToken),
+      body: JSON.stringify({ enabled: params.enabled }),
+    });
+  }
+
   static async chat(params: {
+
     vaultOwnerToken: string;
     message?: string;
     conversationId?: string | null;

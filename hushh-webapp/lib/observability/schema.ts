@@ -196,6 +196,16 @@ const EVENT_ALLOWED_KEYS: Record<ObservabilityEventName, readonly string[]> = {
     "duration_bucket",
     "review_required",
   ],
+  one_location_onboarding_completed: [
+    ...BASE_ALLOWED_KEYS,
+    "result",
+    "exited_via",
+    "code_shared",
+    "code_copied",
+    "screens_seen",
+    "contacts_matched",
+    "contacts_added",
+  ],
   one_location_contact_signal_synced: [
     ...BASE_ALLOWED_KEYS,
     "result",
@@ -203,6 +213,10 @@ const EVENT_ALLOWED_KEYS: Record<ObservabilityEventName, readonly string[]> = {
     "contact_count_bucket",
     "matched_count",
     "invite_candidate_count",
+    "contact_region",
+    "partial_access",
+    "truncated",
+    "failure_reason",
   ],
   one_location_request_sent: [
     ...BASE_ALLOWED_KEYS,

@@ -25,6 +25,7 @@ class FakeConnectedSystemsService:
         self.search_payload = None
         self.disconnected_payload = None
         self.schema_calls = 0
+        self.encrypted_fields_payload = None
 
     def list_systems(self):
         return [
@@ -140,6 +141,49 @@ class FakeConnectedSystemsService:
             "action": "update",
             "status": "pending",
             "fieldNames": ["MailingCity"],
+        }
+
+    def crm_encrypted_fields_configuration(self, **kwargs):
+        self.encrypted_fields_payload = kwargs
+        return {
+            "profile": "crm-encrypted-fields.v1",
+            "configurationRevision": 1,
+            "recipientKey": {"keyId": "uat-key", "publicKey": "public"},
+            "keyDerivation": "SHA-256(X25519 shared secret)",
+            "aad": False,
+        }
+
+    async def read_bound_record_encrypted_fields(self, **kwargs):
+        self.encrypted_fields_payload = kwargs
+        return {
+            "profile": "crm-encrypted-fields.v1",
+            "systemId": kwargs["system_id"],
+            "objectType": kwargs["object_type"],
+            "status": "succeeded",
+            "totalSize": 1,
+            "recordId": "003gK00000demoQAA",
+            "bindingStatus": "active",
+            "encryptedFields": kwargs["encrypted_fields"],
+        }
+
+    async def create_encrypted_fields_update_intent(self, **kwargs):
+        self.encrypted_fields_payload = kwargs
+        return {
+            "intentId": "csi_encrypted",
+            "systemId": kwargs["system_id"],
+            "action": "update",
+            "status": "pending",
+            "fieldNames": kwargs["field_names"],
+        }
+
+    async def approve_encrypted_fields_intent(self, **kwargs):
+        self.encrypted_fields_payload = kwargs
+        return {
+            "intentId": kwargs["intent_id"],
+            "systemId": kwargs["system_id"],
+            "action": "update",
+            "status": "succeeded",
+            "fieldNames": ["Title"],
         }
 
     def create_delete_intent(self, **kwargs):
@@ -413,7 +457,9 @@ def test_search_route_uses_verified_owner_identity(monkeypatch):
     response = client.post(
         "/api/connected-systems/salesforce-fsc-customer0/records/search",
         headers={"Authorization": "Bearer HCT:test"},
-        json={"objectType": "Contact", "returnFields": ["LeadSource", "MailingCity"]},
+        # The browser may carry a legacy objectType field, but the registry-owned
+        # read operation remains the sole authority for record discovery.
+        json={"objectType": "Account", "returnFields": ["LeadSource", "MailingCity"]},
     )
 
     assert response.status_code == 200
@@ -425,6 +471,76 @@ def test_search_route_uses_verified_owner_identity(monkeypatch):
         "return_fields": ["LeadSource", "MailingCity"],
         "force_refresh": False,
     }
+
+
+def test_encrypted_fields_read_route_accepts_only_opaque_values(monkeypatch):
+    service = FakeConnectedSystemsService()
+    monkeypatch.setattr(connected_systems, "get_connected_systems_service", lambda: service)
+    client = TestClient(_build_app())
+    encrypted_fields = {"profile": "crm-encrypted-fields.v1", "ciphertext": "opaque"}
+
+    response = client.post(
+        "/api/connected-systems/salesforce-fsc-customer0/records/read-encrypted",
+        headers={"Authorization": "Bearer HCT:test"},
+        json={
+            "objectType": "Contact",
+            "returnFields": ["FirstName", "LastName"],
+            "encryptedFields": encrypted_fields,
+        },
+    )
+
+    assert response.status_code == 200
+    assert service.encrypted_fields_payload == {
+        "user_id": "user_123",
+        "system_id": "salesforce-fsc-customer0",
+        "object_type": "Contact",
+        "return_fields": ["FirstName", "LastName"],
+        "encrypted_fields": encrypted_fields,
+    }
+
+    rejected = client.post(
+        "/api/connected-systems/salesforce-fsc-customer0/records/read-encrypted",
+        headers={"Authorization": "Bearer HCT:test"},
+        json={
+            "objectType": "Contact",
+            "returnFields": ["FirstName"],
+            "searchFields": {"Email": "must-not-cross-hussh"},
+            "encryptedFields": encrypted_fields,
+        },
+    )
+    assert rejected.status_code == 422
+
+
+def test_encrypted_fields_update_and_approval_routes_keep_values_opaque(monkeypatch):
+    service = FakeConnectedSystemsService()
+    monkeypatch.setattr(connected_systems, "get_connected_systems_service", lambda: service)
+    client = TestClient(_build_app())
+    encrypted_fields = {"profile": "crm-encrypted-fields.v1", "ciphertext": "opaque"}
+
+    prepared = client.post(
+        "/api/connected-systems/salesforce-fsc-customer0/records/update-intents-encrypted",
+        headers={"Authorization": "Bearer HCT:test"},
+        json={
+            "objectType": "Contact",
+            "fieldNames": ["Title"],
+            "encryptedFields": encrypted_fields,
+        },
+    )
+    assert prepared.status_code == 200
+    assert service.encrypted_fields_payload["encrypted_fields"] == encrypted_fields
+    assert service.encrypted_fields_payload["locked_field_names"] == {
+        "Email",
+        "Phone",
+        "FirstName",
+        "LastName",
+    }
+
+    approved = client.post(
+        "/api/connected-systems/salesforce-fsc-customer0/intents/csi_encrypted/approve-encrypted",
+        headers={"Authorization": "Bearer HCT:test"},
+    )
+    assert approved.status_code == 200
+    assert approved.json()["status"] == "succeeded"
 
 
 def test_update_intent_route_resolves_bound_record_id(monkeypatch):

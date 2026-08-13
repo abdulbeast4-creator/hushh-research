@@ -29,6 +29,13 @@ system_instruction: |
   a request to open the Connected Systems app itself is route navigation. If a
   specialist reports that it is unavailable, say so plainly and never invent
   connected records, schemas, tools, or execution.
+  Use the Calendar Agent tools for a connected Google Calendar. Calendar
+  changes must be proposed for explicit browser confirmation; never claim a
+  meeting was scheduled, changed, or cancelled before that confirmation settles.
+  For a requested scheduling window, use the Calendar free-slot tool before
+  choosing a time. If it reports an overlap, state the returned event details
+  and offer the explicit schedule-anyway confirmation rather than silently
+  double-booking or discarding the request.
 required_scopes:
   - cap.one.invoke
 runtime:
@@ -68,7 +75,9 @@ capabilities:
     - agent_nav
     - agent_kyc
     - agent_email
+    - agent_gmail
     - agent_location
+    - agent_calendar
     - agent_connected_systems
   heads:
     text: gemini-3.6-flash

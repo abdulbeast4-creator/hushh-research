@@ -10,7 +10,7 @@ import {
   AppPageHeaderRegion,
   AppPageShell,
 } from "@/components/app-ui/app-page-shell";
-import { AdvisorsNearby } from "@/components/connect/advisors-nearby";
+import { NearbyDirectories } from "@/components/connect/nearby-directories";
 import { PageHeader } from "@/components/app-ui/page-sections";
 import { SettingsGroup, SettingsRow } from "@/components/app-ui/settings-ui";
 import { SurfaceStack } from "@/components/app-ui/surfaces";
@@ -42,12 +42,19 @@ import { SegmentedTabs } from "@/lib/morphy-ux/ui";
 import {
   ConnectionsService,
   type ConnectionInformationScopeCatalog,
+  type ConnectionRelationship,
   type ConnectionScopeCatalog,
   type ConnectionSummaryEntry,
   type DirectoryPerson,
 } from "@/lib/services/connections-service";
 import { relationshipCta } from "@/lib/connections/relationship-label";
+import {
+  VOICE_CONFIRM_DATA_KEY,
+  VOICE_DISAMBIGUATION_DATA_KEY,
+} from "@/lib/voice/voice-action-card";
+import { getKaiActionById } from "@/lib/voice/kai-action-gateway";
 import { getDirectoryPersonDescription } from "./directory-person-label";
+import { cn } from "@/lib/utils";
 
 type ConnectTab = "people" | "nearby";
 
@@ -75,6 +82,142 @@ const SUGGESTED_PEOPLE_LIMIT = 8;
  */
 const PAGE_SIZE_OPTIONS = [8, 16, 24, 50] as const;
 const DEFAULT_PAGE_SIZE = SUGGESTED_PEOPLE_LIMIT;
+const CONNECT_ROW_ACTION_CLASSNAME =
+  "h-8 min-h-8 rounded-2xl px-2.5 text-[14px] font-semibold leading-[18px]";
+const CONNECT_PAGER_BUTTON_CLASSNAME =
+  "h-[30px] min-h-[30px] rounded-[15px] px-2.5 text-[14px] font-semibold leading-[18px]";
+
+/** Maximum number of connection requests the People bulk action can send. */
+const MAX_BULK_CONNECTION_REQUESTS = 20;
+
+/**
+ * Bounds on resolving ONE spoken name against the directory.
+ *
+ * Wide enough that the answer is about the person rather than about where
+ * they happened to land in a result set, and bounded because the directory is
+ * every account on Hussh — a runaway loop here would be worse than a refusal.
+ * 250 rows for a single queried name is far past the point where a name is
+ * still identifying anyway; beyond that, ambiguity is the honest answer.
+ */
+const DIRECTORY_RESOLVE_PAGE_SIZE = 50;
+const DIRECTORY_RESOLVE_MAX_PAGES = 5;
+
+/**
+ * Match a spoken name against a list the server just returned.
+ *
+ * Deliberately more forgiving than `connect.send_request`'s exact
+ * `localeCompare`, and deliberately narrower than the Location composer's
+ * search. Someone says "Sarah", not "Sarah Chen", and refusing that is a
+ * refusal the person cannot act on -- they said the name they know. But
+ * matching on anything other than the NAME (headline, relationship, any other
+ * recommendation text) is how a search returns a person nobody asked for.
+ *
+ * Exact wins outright. Only when nothing matches exactly does a prefix or
+ * word-boundary match count, and every candidate is returned so the caller can
+ * refuse an ambiguous one rather than picking. Nothing here decides; it
+ * reports how many the words could mean.
+ */
+/**
+ * The button one duplicate gets in the disambiguation card.
+ *
+ * Two rows sharing a display name are routinely in different relationship
+ * states -- the screenshot that prompted this had one "Connect" and one
+ * "Cancel request" -- so a single fixed label would offer at least one of them
+ * an action guaranteed to be refused the moment it ran.
+ *
+ * Labels come from `relationshipCta`, the same source the Connect list uses, so
+ * the card and the list behind it can never disagree about what a person's
+ * state is called.
+ *
+ * Only a genuine `connect` is tappable here. `respond` is deliberately not:
+ * answering someone else's invitation is a different action on a different
+ * screen, and `connect.send_request` refuses it anyway -- offering it would
+ * spend the person's tap to earn a refusal.
+ */
+function connectCandidateAffordance(relationship: ConnectionRelationship): {
+  actionLabel: string;
+  disabledReason: string | null;
+} {
+  const cta = relationshipCta(relationship);
+  if (cta.action === "connect") {
+    return { actionLabel: cta.label, disabledReason: null };
+  }
+  if (relationship === "connected") {
+    return { actionLabel: cta.label, disabledReason: "Already connected" };
+  }
+  if (relationship === "pending_outgoing") {
+    return { actionLabel: cta.label, disabledReason: "Waiting on them" };
+  }
+  if (relationship === "pending_incoming") {
+    return { actionLabel: cta.label, disabledReason: "They asked you first" };
+  }
+  return { actionLabel: cta.label, disabledReason: "Not available" };
+}
+
+function matchByName<T>(
+  rows: readonly T[],
+  spoken: string,
+  nameOf: (row: T) => string | null | undefined,
+): T[] {
+  const normalize = (value: string) =>
+    value
+      .normalize("NFD")
+      .replace(/\p{Diacritic}/gu, "")
+      .toLowerCase()
+      // Punctuation out, so an initial is just a letter. Directories store
+      // "Abdul R." and "Abdul R" and "Abdul R,"; nobody says the full stop,
+      // and leaving it in means "r." can never be recognised as the start of
+      // "rashid".
+      // \p{M} is kept deliberately: Devanagari and Arabic vowel signs are
+      // marks, not letters, so dropping them shreds "परिवार" into "पर व र" and
+      // a name written in an Indic script can never match itself.
+      .replace(/[^\p{L}\p{N}\p{M}\s]/gu, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+  const target = normalize(spoken);
+  if (!target) return [];
+  const named = rows.filter((row) => normalize(String(nameOf(row) ?? "")).length > 0);
+
+  const exact = named.filter((row) => normalize(String(nameOf(row))) === target);
+  if (exact.length > 0) return exact;
+
+  const contains = named.filter((row) => {
+    const name = normalize(String(nameOf(row)));
+    return name.startsWith(`${target} `) || name.split(" ").includes(target);
+  });
+  if (contains.length > 0) return contains;
+
+  // Last tier: every word of the shorter name accounted for in the longer.
+  //
+  // Names are not stored the way people say them. Someone says "Abdul
+  // Rashid" and the directory holds "Abdul R."; someone says "Abdul" and it
+  // holds "Abdul Kumar Rashid". Neither is exact, neither is a prefix, and
+  // neither contains the other as a whole word -- so both failed, about a
+  // person visible on screen.
+  //
+  // Word-level and prefix-wise, so "r" matches "rashid" and an initial does
+  // its job, but "abdul" can never match "abdullah" as a whole spoken name
+  // because the tiers above would have claimed a better candidate first.
+  const targetWords = target.split(" ").filter(Boolean);
+  return named.filter((row) => {
+    const nameWords = normalize(String(nameOf(row))).split(" ").filter(Boolean);
+    const [shorter, longer] =
+      targetWords.length <= nameWords.length
+        ? [targetWords, nameWords]
+        : [nameWords, targetWords];
+    if (shorter.length === 0) return false;
+    const remaining = [...longer];
+    return shorter.every((word) => {
+      const hit = remaining.findIndex(
+        (candidate) => candidate.startsWith(word) || word.startsWith(candidate),
+      );
+      if (hit === -1) return false;
+      // Consumed, so two spoken words cannot both claim the same stored one.
+      remaining.splice(hit, 1);
+      return true;
+    });
+  });
+}
 
 export default function ConnectPageClient() {
   const { user } = useRequireAuth();
@@ -241,8 +384,8 @@ export default function ConnectPageClient() {
       person: DirectoryPerson,
       requestedScopeHandles: string[] = [],
       offeredScopeHandles: string[] = [],
-    ) => {
-      if (!user) return;
+    ): Promise<boolean> => {
+      if (!user) return false;
       try {
         setBusyId(person.userId);
         const idToken = await user.getIdToken();
@@ -266,12 +409,14 @@ export default function ConnectPageClient() {
         setScopeDraft(null);
         CacheSyncService.onConnectionCapabilityMutated(user.uid);
         toast.success("Connection request sent");
+        return true;
       } catch (sendError) {
         toast.error(
           sendError instanceof Error
             ? sendError.message
             : "Failed to send request",
         );
+        return false;
       } finally {
         setBusyId(null);
       }
@@ -411,9 +556,18 @@ export default function ConnectPageClient() {
 
   const handleConnectMultiple = useCallback(async () => {
     if (!user || selectedUserIds.size === 0) return;
+    const selectedPeople = people.filter((p) => selectedUserIds.has(p.userId));
+
+    // Keep the dispatch boundary bounded even if selection state is restored or
+    // changed outside the row controls.
+    if (selectedPeople.length > MAX_BULK_CONNECTION_REQUESTS) {
+      toast.error(`Select no more than ${MAX_BULK_CONNECTION_REQUESTS} people at a time.`);
+      return;
+    }
+
     setIsConnectingMultiple(true);
     let successCount = 0;
-    const selectedPeople = people.filter((p) => selectedUserIds.has(p.userId));
+    const successfulUserIds = new Set<string>();
     
     try {
       const idToken = await user.getIdToken();
@@ -430,6 +584,7 @@ export default function ConnectPageClient() {
               ...current,
               [person.userId]: request.id,
             }));
+            successfulUserIds.add(person.userId);
             successCount++;
           } catch (_err) {
             console.error(`Failed to send request to ${person.userId}`, _err);
@@ -439,7 +594,7 @@ export default function ConnectPageClient() {
       
       setPeople((prev) =>
         prev.map((p) =>
-          selectedUserIds.has(p.userId) && p.relationship === "none"
+          successfulUserIds.has(p.userId) && p.relationship === "none"
             ? { ...p, relationship: "pending_outgoing" }
             : p,
         ),
@@ -497,6 +652,44 @@ export default function ConnectPageClient() {
   // Present connections in a stable, predictable order: alphabetical by the
   // name the user sees (case-insensitive), falling back to the userId when a
   // display name is absent. Locale compare keeps accented names sensibly placed.
+  // Present the People directory in the same predictable order as connections:
+  // alphabetical (A-Z) by the visible name, case/accent-insensitive. When a
+  // search query is active, names that START with the query rank above inner
+  // matches (so "Ab" surfaces "Abdul" before "Zab…"), then A-Z within each
+  // group. The server can return directory rows in relevance/insertion order,
+  // which read as unsorted in the list; this makes the rendered order stable.
+  const sortedPeople = useMemo(() => {
+    const q = trimmedQuery.toLowerCase();
+    const nameOf = (person: DirectoryPerson) =>
+      (person.displayName || person.email || person.userId)
+        .trim()
+        .toLowerCase();
+    // Strict prefix filter. The directory API matches a substring anywhere
+    // (`LIKE '%q%'`), so typing "z" returned "Abdul Zalil" and "shankz".
+    // Constrain the rendered list to entries whose NAME (full or any word) or
+    // EMAIL local-part starts with the query, which is what the user expects
+    // from a name search. Applied on top of the server result, so it never
+    // fetches more; it only hides the substring-only matches.
+    const prefixMatches = (person: DirectoryPerson): boolean => {
+      if (!q) return true;
+      const name = nameOf(person);
+      if (name.startsWith(q)) return true;
+      if (name.split(/\s+/).some((word) => word.startsWith(q))) return true;
+      const email = (person.email || "").trim().toLowerCase();
+      return email.startsWith(q) || email.split("@")[0]?.startsWith(q) === true;
+    };
+    return [...people].filter(prefixMatches).sort((a, b) => {
+      const nameA = nameOf(a);
+      const nameB = nameOf(b);
+      if (q) {
+        const startsA = nameA.startsWith(q);
+        const startsB = nameB.startsWith(q);
+        if (startsA !== startsB) return startsA ? -1 : 1;
+      }
+      return nameA.localeCompare(nameB, undefined, { sensitivity: "base" });
+    });
+  }, [people, trimmedQuery]);
+
   const sortedConnections = useMemo(
     () =>
       [...connections].sort((a, b) =>
@@ -526,12 +719,13 @@ export default function ConnectPageClient() {
       spokenSubject: tab === "nearby" ? "Connect, Around you tab" : "Connect, People tab",
       sections: [
         { id: "people", title: "People", purpose: "Search everyone you could connect with, and manage existing connections." },
-        { id: "nearby", title: "Around you", purpose: "Find advisors near your current location." },
+        { id: "nearby", title: "Around you", purpose: "Find verified advisors and insurance agents, and businesses, near your current location." },
       ],
       actions: [
         { id: "connect.open_people", actionId: "connect.open_people", label: "Open Connect people", purpose: "Show connections and the people directory." },
         { id: "connect.open_nearby", actionId: "connect.open_nearby", label: "Open advisors around you", purpose: "Show advisors near you." },
-        { id: "connect.search_people", actionId: "connect.search_people", label: "Search for someone to connect with", purpose: "Put the cursor in the people search box." },
+        { id: "connect.search_people", actionId: "connect.search_people", label: "Search for someone to connect with", purpose: "Search the directory for the spoken name." },
+        { id: "connect.send_request", actionId: "connect.send_request", label: "Send a connection request", purpose: "Send a request to one exact name after the person confirms by voice." },
       ],
       // Only the search box carries a `data-voice-control-id` anchor. The tab
       // strip is the shared SegmentedTabs, which has no per-option control id,
@@ -551,7 +745,9 @@ export default function ConnectPageClient() {
       activeSection: tab === "nearby" ? "Around you" : "People",
       activeTab: tab,
       visibleModules:
-        tab === "nearby" ? ["Advisors near you"] : ["Your connections", "People directory"],
+        tab === "nearby"
+          ? ["Advisors near you", "Insurance agents near you", "Places near you"]
+          : ["Your connections", "People directory"],
       focusedWidget: tab === "nearby" ? "Around you tab" : "People tab",
       availableActions: ["Open Connect people", "Open advisors around you", "Search for someone to connect with"],
       activeControlId: null,
@@ -577,19 +773,353 @@ export default function ConnectPageClient() {
     setTab("nearby");
     return { status: "succeeded", summary: "Advisors around you opened." };
   });
-  useLocalOnboardingActionHandler("connect.search_people", () => {
-    // Focus only. Typing the name is the person's to do -- One filling the box
-    // would be searching the directory on their behalf.
+  useLocalOnboardingActionHandler("connect.search_people", (slots) => {
+    // The model provides only the words it heard. This mounted surface resolves
+    // those words against the directory it already holds; no account id or
+    // contact information crosses the voice boundary.
+    const person = typeof slots.person === "string" ? slots.person.trim() : "";
+    if (!person) {
+      return { status: "blocked", summary: "Say the name to search for in Connect." };
+    }
     setTab("people");
+    setQuery(person);
     searchInputRef.current?.focus();
-    return { status: "succeeded", summary: "People search focused." };
+    return { status: "succeeded", summary: "Searching Connect for the name you gave." };
+  });
+  useLocalOnboardingActionHandler("connect.send_request", async (slots) => {
+    const spokenName = typeof slots.person === "string" ? slots.person.trim() : "";
+    // Set only by the disambiguation card, which resolves a name the person
+    // already saw into the one account they pointed at. It skips the matcher
+    // entirely rather than re-running it: the ambiguity has been settled by a
+    // human, and re-deriving it from the same words would just fail the same
+    // way and bounce the card straight back.
+    const chosenUserId = typeof slots.userId === "string" ? slots.userId.trim() : "";
+    if (!user) {
+      return { status: "blocked", summary: "Sign in before sending a connection request." };
+    }
+    if (!spokenName && !chosenUserId) {
+      return { status: "blocked", summary: "Say the person's full name before sending a request." };
+    }
+
+    try {
+      const idToken = await user.getIdToken();
+      // Read the whole result set for this name, not its first three rows.
+      //
+      // This searched page 1 at limit 3 and refused outright whenever
+      // `hasMore` was true, so it could never tell "no such person" from "not
+      // on the first page" -- and it answered both with "I could not identify
+      // one exact person by that name", about people who were plainly there.
+      // Bounded, because a directory is unbounded and a runaway loop here
+      // would be worse than a refusal.
+      // Search on ONE word, then match the full name here.
+      //
+      // The server predicate is a single substring test --
+      // `LOWER(display_name) LIKE '%' || query || '%'` -- so passing the whole
+      // spoken name makes the whole name have to appear, contiguously, exactly
+      // as stored. "Abdul Rashid" then finds nobody when the directory holds
+      // "Abdul R.", and "Abdul" finds nobody when it holds "Abdul Kumar
+      // Rashid". Reported as voice being unable to find people plainly visible
+      // in the list, which is exactly what it was: the query could not reach
+      // them, so there was never a candidate for the matcher to consider.
+      //
+      // One token maximises what comes back; deciding WHICH person stays here,
+      // where the whole name is available. Longest word rather than first,
+      // because it is the most selective and least likely to be a title or
+      // initial.
+      const searchTerm =
+        spokenName
+          .split(/\s+/)
+          .filter(Boolean)
+          .sort((left, right) => right.length - left.length)[0] ?? spokenName;
+      const candidates: DirectoryPerson[] = [];
+      for (let pageNumber = 1; pageNumber <= DIRECTORY_RESOLVE_MAX_PAGES; pageNumber += 1) {
+        const page = await ConnectionsService.searchDirectory({
+          idToken,
+          query: searchTerm,
+          page: pageNumber,
+          limit: DIRECTORY_RESOLVE_PAGE_SIZE,
+        });
+        candidates.push(...page.items);
+        if (!page.hasMore) break;
+      }
+      // Same matcher the cancel and remove actions use: exact wins outright,
+      // and only when nothing is exact does a prefix or whole-word match
+      // count, so "Sarah" finds "Sarah Chen" without "Chen" matching every
+      // Chen. Requiring full-name equality made the person say a name the way
+      // the directory happens to store it, which is not something they can
+      // know.
+      // A resolved id wins outright: the person has already pointed at a row.
+      const exactMatches = chosenUserId
+        ? candidates.filter((c) => c.userId === chosenUserId)
+        : matchByName(candidates, spokenName, (c) => c.displayName);
+      if (exactMatches.length === 0) {
+        return {
+          status: "blocked",
+          summary: chosenUserId
+            ? "That person is no longer in the directory."
+            : `I could not find anyone called ${spokenName} in Connect.`,
+        };
+      }
+      if (exactMatches.length > 1) {
+        // Show them instead of asking. Naming the candidates aloud was already
+        // better than "be more specific", but it cannot resolve the ordinary
+        // case where two accounts share a display name -- there is no utterance
+        // that separates them, so the person is asked for something they cannot
+        // give. What tells them apart is the handle under the name, so it has
+        // to be seen.
+        return {
+          status: "blocked",
+          summary: `${exactMatches.length} people are called ${spokenName}. Pick the right one.`,
+          data: {
+            [VOICE_DISAMBIGUATION_DATA_KEY]: {
+              actionId: "connect.send_request",
+              resolveSlot: "userId",
+              slots: { person: spokenName },
+              prompt: `${exactMatches.length} people are called ${spokenName}.`,
+              candidates: exactMatches.map((c) => ({
+                id: c.userId,
+                name: c.displayName || "Someone",
+                // The same description the Connect list renders under each
+                // name. Reading `email` alone showed "No other details" on
+                // rows the list behind the card was captioning correctly:
+                // the directory usually returns the masked variants, not the
+                // raw address. This helper already falls through
+                // email -> maskedEmail -> maskedPhone, so contact sync's phone
+                // numbers land here without another change.
+                detail: getDirectoryPersonDescription(c) ?? null,
+                ...connectCandidateAffordance(c.relationship),
+              })),
+            },
+          },
+        };
+      }
+      const person = exactMatches[0];
+      if (!person) {
+        return {
+          status: "blocked",
+          summary: "I could not identify one exact person by that name.",
+        };
+      }
+      // The backend already distinguishes these four, and collapsing them lost
+      // the only part the person needed. "A new connection request is not
+      // available" was returned when they were ALREADY connected -- which is
+      // success -- and equally when the other party had yet to accept, when
+      // the person had an invitation of their own sitting unread, and when
+      // something had genuinely gone wrong. Reported as One saying it needed
+      // approval for something already done.
+      //
+      // Only `none` sends. The rest each mean something specific and are said
+      // plainly, because two of them are not problems at all.
+      if (person.relationship === "connected") {
+        return {
+          // `succeeded`, not `blocked`. The person asked to be connected to
+          // someone they are already connected to: the thing they wanted is
+          // true, so anything that sounds like a refusal is a lie about their
+          // own account. (A local handler has no `noop`; the settlement enum
+          // does, but this layer only speaks started/succeeded/blocked/failed.)
+          status: "succeeded",
+          summary: `You are already connected to ${person.displayName}, so there was nothing to send.`,
+        };
+      }
+      if (person.relationship === "pending_outgoing") {
+        return {
+          status: "blocked",
+          // The honest boundary: nothing the app or One can do advances this.
+          summary: `You already asked ${person.displayName} to connect, and it is waiting on them to accept. Nobody here can move that along.`,
+        };
+      }
+      if (person.relationship === "pending_incoming") {
+        return {
+          status: "blocked",
+          summary: `${person.displayName} has already asked to connect with you. Open Connect and accept their request instead of sending one back.`,
+        };
+      }
+      if (person.relationship !== "none") {
+        return {
+          status: "blocked",
+          summary: "A new connection request is not available for that person.",
+        };
+      }
+      const sent = await sendConnectionRequest(person);
+      if (!sent) {
+        return { status: "failed", summary: "Could not send the connection request." };
+      }
+      return {
+        status: "succeeded",
+        summary: `Connection request sent to ${person.displayName}.`,
+      };
+    } catch (error) {
+      return {
+        status: "failed",
+        summary:
+          error instanceof Error
+            ? error.message
+            : "Could not send the connection request.",
+      };
+    }
+  });
+
+  useLocalOnboardingActionHandler("connect.cancel_request", async (slots) => {
+    const spokenName = typeof slots.person === "string" ? slots.person.trim() : "";
+    if (!user) {
+      return { status: "blocked", summary: "Sign in before cancelling a request." };
+    }
+    if (!spokenName) {
+      return { status: "blocked", summary: "Say whose request you want to cancel." };
+    }
+    try {
+      const idToken = await user.getIdToken();
+      // Ask the server for the outgoing requests rather than matching against
+      // whatever the directory happens to be showing. `connect.send_request`
+      // resolves through a page-1/limit-3 search, which cannot tell "no such
+      // person" from "not on the first page"; cancelling the wrong request, or
+      // refusing to cancel a real one, are both worse than a slower lookup.
+      const outgoing = await ConnectionsService.listRequests({
+        idToken,
+        direction: "outgoing",
+      });
+      const matches = matchByName(outgoing, spokenName, (request) =>
+        request.counterpartDisplayName,
+      );
+      if (matches.length === 0) {
+        return {
+          status: "blocked",
+          summary: `You have no pending request to ${spokenName}.`,
+        };
+      }
+      if (matches.length > 1) {
+        return {
+          status: "blocked",
+          summary: `More than one pending request matches that name: ${matches
+            .map((request) => request.counterpartDisplayName ?? "someone")
+            .join(", ")}. Say which one.`,
+        };
+      }
+      const request = matches[0]!;
+      await ConnectionsService.cancel({ idToken, requestId: request.id });
+      CacheSyncService.onConnectionCapabilityMutated(user.uid);
+      await loadOutgoingRequestIds();
+      return {
+        status: "succeeded",
+        summary: `Cancelled your connection request to ${request.counterpartDisplayName ?? spokenName}.`,
+      };
+    } catch (error) {
+      return {
+        status: "failed",
+        summary:
+          error instanceof Error ? error.message : "Could not cancel that request.",
+      };
+    }
+  });
+
+  useLocalOnboardingActionHandler("connect.remove_connection", async (slots) => {
+    const spokenName = typeof slots.person === "string" ? slots.person.trim() : "";
+    // Set by the card's destructive button and by nothing else. Voice never
+    // carries it, so a spoken sentence can raise this question but can never
+    // answer its own question.
+    const confirmed = slots.confirmed === true;
+    const chosenConnectionId =
+      typeof slots.connectionId === "string" ? slots.connectionId.trim() : "";
+    if (!user) {
+      return { status: "blocked", summary: "Sign in before removing a connection." };
+    }
+    if (!spokenName && !chosenConnectionId) {
+      return { status: "blocked", summary: "Say who you want to remove." };
+    }
+    try {
+      const idToken = await user.getIdToken();
+      const existing = await ConnectionsService.listConnections({ idToken });
+      const matches = chosenConnectionId
+        ? existing.filter((entry) => entry.connectionId === chosenConnectionId)
+        : matchByName(existing, spokenName, (entry) => entry.displayName);
+      if (matches.length === 0) {
+        return {
+          status: "blocked",
+          summary: chosenConnectionId
+            ? "That connection is no longer there."
+            : `${spokenName} is not one of your connections.`,
+        };
+      }
+      if (matches.length > 1) {
+        // Same picker as sending a request. Removing the wrong person because
+        // two share a name is the worst version of this bug, not a milder one.
+        return {
+          status: "blocked",
+          summary: `${matches.length} connections are called ${spokenName}. Pick the right one.`,
+          data: {
+            [VOICE_DISAMBIGUATION_DATA_KEY]: {
+              actionId: "connect.remove_connection",
+              resolveSlot: "connectionId",
+              slots: { person: spokenName },
+              prompt: `${matches.length} connections are called ${spokenName}.`,
+              candidates: matches.map((entry) => ({
+                id: entry.connectionId,
+                name: entry.displayName || "Someone",
+                detail: getDirectoryPersonDescription(entry) ?? null,
+                actionLabel: "Remove",
+              })),
+            },
+          },
+        };
+      }
+      const connection = matches[0]!;
+      if (!confirmed) {
+        // Ask before, not after. A name misheard once is a connection gone
+        // with no undo, and this is the one action here where being wrong
+        // cannot be walked back.
+        const displayName = connection.displayName || "this person";
+        return {
+          status: "blocked",
+          summary: `Removing ${displayName} needs a confirmation.`,
+          data: {
+            [VOICE_CONFIRM_DATA_KEY]: {
+              actionId: "connect.remove_connection",
+              slots: { person: spokenName, connectionId: connection.connectionId },
+              prompt: `Remove your connection with ${displayName}?`,
+              subject: {
+                name: displayName,
+                detail: getDirectoryPersonDescription(connection) ?? null,
+              },
+              // The action's own words from the generated contract, so what
+              // the person is warned about cannot drift from what happens.
+              consequence:
+                getKaiActionById("connect.remove_connection")?.meaning ?? null,
+              confirmLabel: "Remove",
+            },
+          },
+        };
+      }
+      await ConnectionsService.removeConnection({
+        idToken,
+        connectionId: connection.connectionId,
+      });
+      setConnections((prev) =>
+        prev.filter((c) => c.connectionId !== connection.connectionId),
+      );
+      CacheSyncService.onConnectionCapabilityMutated(user.uid);
+      return {
+        status: "succeeded",
+        // Say the consequence, not just the fact. Removing a connection also
+        // removes them from everywhere that connection was the prerequisite --
+        // Location sharing above all -- and someone who only meant to tidy a
+        // list should hear that before they discover it.
+        summary: `Removed ${connection.displayName ?? spokenName}. They can no longer be picked for location sharing.`,
+      };
+    } catch (error) {
+      return {
+        status: "failed",
+        summary:
+          error instanceof Error ? error.message : "Could not remove that connection.",
+      };
+    }
   });
 
   return (
     <AppPageShell
       as="main"
+      fitContent
       width="reading"
-      className="relative isolate pb-[calc(var(--app-bottom-fixed-ui,96px)+1.25rem)] sm:pb-10 md:pb-8"
+      className="relative isolate"
       nativeTest={{
         routeId: "/one/connect",
         marker: "native-route-connect",
@@ -619,7 +1149,7 @@ export default function ConnectPageClient() {
             />
 
             {tab === "nearby" ? (
-              <AdvisorsNearby getIdToken={getIdToken} />
+              <NearbyDirectories getIdToken={getIdToken} />
             ) : (
               <div className="space-y-4 sm:space-y-5">
             <SettingsGroup
@@ -639,16 +1169,16 @@ export default function ConnectPageClient() {
                     key={connection.connectionId}
                     icon={Users}
                     iconTone="blue"
-                    stackTrailingOnMobile
                     title={connection.displayName || connection.userId}
                     density="compact"
                     trailing={
-                      <span className="flex shrink-0 items-center gap-1">
+                      <span className="flex shrink-0 items-center gap-1 whitespace-nowrap">
                         <Button
                           type="button"
                           variant="none"
                           effect="fade"
                           size="sm"
+                          className="h-8 rounded-[10px] px-3 text-[13px] font-medium"
                           disabled={busyId === connection.connectionId}
                           onClick={() => void viewInformationScopes(connection)}
                         >
@@ -661,6 +1191,7 @@ export default function ConnectPageClient() {
                               variant="destructive"
                               effect="fill"
                               size="sm"
+                              className="h-8 rounded-[10px] px-3 text-[13px] font-medium"
                               disabled={busyId === connection.connectionId}
                               onClick={() => void handleRemove(connection)}
                             >
@@ -673,6 +1204,7 @@ export default function ConnectPageClient() {
                               variant="none"
                               effect="fade"
                               size="sm"
+                              className="h-8 rounded-[10px] px-3 text-[13px] font-medium"
                               disabled={busyId === connection.connectionId}
                               onClick={() => setPendingRemoveId(null)}
                             >
@@ -689,7 +1221,7 @@ export default function ConnectPageClient() {
                               setPendingRemoveId(connection.connectionId)
                             }
                             aria-label={`Remove connection with ${connection.displayName || connection.userId}`}
-                            className="text-muted-foreground hover:text-destructive"
+                            className="h-8 rounded-[10px] px-3 text-[13px] font-medium text-muted-foreground hover:text-destructive"
                           >
                             Remove
                           </Button>
@@ -732,6 +1264,16 @@ export default function ConnectPageClient() {
                       // locks the results out of view. Scoped to this field's
                       // focus lifecycle and cleaned up on blur.
                       const field = event.currentTarget;
+                      // Scroll the field into view above the on-screen keyboard.
+                      // Tapping it otherwise leaves it hidden behind the keyboard
+                      // until the user manually scrolls up. The delay lets the
+                      // keyboard animate in so the shrunken viewport is measured.
+                      window.setTimeout(() => {
+                        field.scrollIntoView({
+                          block: "center",
+                          behavior: "smooth",
+                        });
+                      }, 300);
                       const dismiss = () => field.blur();
                       window.addEventListener("touchmove", dismiss, {
                         passive: true,
@@ -746,25 +1288,30 @@ export default function ConnectPageClient() {
                     }}
                   />
                 </div>
-                {/*
-                  The Select / Select All controls are intentionally not
-                  rendered. Bulk-selecting people was not a clear answer to the
-                  problem it was reaching for -- finding the right person in a
-                  list that grows with every signup -- and shipping it invited
-                  people to fan out requests rather than helping them search.
-
-                  The machinery below is deliberately left in place: selection
-                  mode, the per-row checkboxes, and the bulk request action all
-                  still work, and `isSelectionMode` simply has no way to become
-                  true from the UI. Restoring the entry point is a one-line
-                  change if a clearer design arrives. Do not delete the state or
-                  the bulk handler on the grounds that they look unreachable.
-                */}
+                <Button
+                  type="button"
+                  variant="none"
+                  effect="fill"
+                  size="sm"
+                  disabled={loading || people.length === 0}
+                  onClick={() => {
+                    setIsSelectionMode((current) => !current);
+                    setSelectedUserIds(new Set());
+                  }}
+                >
+                  {isSelectionMode ? "Cancel selection" : "Select people"}
+                </Button>
               </div>
               <SettingsGroup
                 title="People"
                 description={
-                  hasQuery
+                  isSelectionMode
+                    ? (
+                        <span id="connect-selection-limit">
+                          Select up to {MAX_BULK_CONNECTION_REQUESTS} people to send connection requests.
+                        </span>
+                      )
+                    : hasQuery
                     ? "Send a connection request to someone you know."
                     : "A few people on Hussh. Search by name to find someone specific."
                 }
@@ -800,29 +1347,50 @@ export default function ConnectPageClient() {
                     />
                   )
                 ) : (
-                  people.map((person) => {
+                  sortedPeople.map((person) => {
                     const cta = relationshipCta(person.relationship);
                     const title =
                       person.displayName || person.email || person.userId;
                     const description = getDirectoryPersonDescription(person);
+                    const isSelected = selectedUserIds.has(person.userId);
+                    const selectionLimitReached =
+                      selectedUserIds.size >= MAX_BULK_CONNECTION_REQUESTS;
                     return (
                       <SettingsRow
                         key={person.userId}
                         icon={UserRound}
                         iconTone="blue"
-                        title={title}
-                        description={description}
+                        title={<span className="block min-w-0 truncate">{title}</span>}
+                        description={
+                          description ? (
+                            <span className="block min-w-0 truncate">
+                              {description}
+                            </span>
+                          ) : undefined
+                        }
                         density="compact"
                         trailing={
                           isSelectionMode ? (
                             <Checkbox
-                              checked={selectedUserIds.has(person.userId)}
-                              disabled={person.relationship !== "none"}
+                              checked={isSelected}
+                              disabled={
+                                person.relationship !== "none" ||
+                                (!isSelected && selectionLimitReached)
+                              }
+                              aria-describedby="connect-selection-limit"
                               onCheckedChange={(checked) => {
-                                const next = new Set(selectedUserIds);
-                                if (checked) next.add(person.userId);
-                                else next.delete(person.userId);
-                                setSelectedUserIds(next);
+                                setSelectedUserIds((current) => {
+                                  const next = new Set(current);
+                                  if (checked) {
+                                    if (next.size >= MAX_BULK_CONNECTION_REQUESTS) {
+                                      return current;
+                                    }
+                                    next.add(person.userId);
+                                  } else {
+                                    next.delete(person.userId);
+                                  }
+                                  return next;
+                                });
                               }}
                               aria-label={`Select ${title}`}
                             />
@@ -832,6 +1400,10 @@ export default function ConnectPageClient() {
                               variant="none"
                               effect="fill"
                               size="sm"
+                              className={cn(
+                                CONNECT_ROW_ACTION_CLASSNAME,
+                                "min-w-[100px]"
+                              )}
                               disabled={busyId === person.userId}
                               onClick={() => void cancelConnectionRequest(person)}
                             >
@@ -845,6 +1417,10 @@ export default function ConnectPageClient() {
                               variant="none"
                               effect="fill"
                               size="sm"
+                              className={cn(
+                                CONNECT_ROW_ACTION_CLASSNAME,
+                                "min-w-[72px]"
+                              )}
                               disabled={cta.disabled || busyId === person.userId}
                               onClick={() => void handleConnect(person)}
                             >
@@ -857,11 +1433,11 @@ export default function ConnectPageClient() {
                   })
                 )}
                 {people.length > 0 || currentPage > 1 ? (
-                  <div className="flex flex-wrap items-center justify-between gap-3 border-t border-[color:var(--app-card-border-standard)] px-3 py-3">
-                    <div className="flex items-center gap-2">
+                  <div className="grid gap-2 border-t border-[color:var(--app-card-border-standard)] px-3 py-3">
+                    <div className="flex min-h-8 items-center justify-between gap-3">
                       <span
                         id="connect-people-per-page-label"
-                        className="text-xs text-muted-foreground"
+                        className="ui-text-helper-text text-[color:var(--app-secondary-label)]"
                       >
                         Per page
                       </span>
@@ -872,7 +1448,7 @@ export default function ConnectPageClient() {
                         <SelectTrigger
                           size="sm"
                           aria-label="People per page"
-                          className="w-[78px]"
+                          className="h-8 min-h-8 w-[74px] rounded-2xl text-[15px] font-medium leading-5"
                         >
                           <SelectValue />
                         </SelectTrigger>
@@ -885,36 +1461,46 @@ export default function ConnectPageClient() {
                         </SelectContent>
                       </Select>
                     </div>
-                    <div className="flex items-center gap-2">
-                      <Button
-                        type="button"
-                        variant="none"
-                        effect="fill"
-                        size="sm"
-                        disabled={loading || currentPage <= 1}
-                        onClick={() => goToPage(currentPage - 1)}
-                      >
-                        Previous
-                      </Button>
+                    <div className="flex min-h-8 items-center justify-between gap-3">
+                      <div className="flex items-center gap-2">
+                        <Button
+                          type="button"
+                          variant="none"
+                          effect="fill"
+                          size="sm"
+                          className={cn(
+                            CONNECT_PAGER_BUTTON_CLASSNAME,
+                            "min-w-[76px]"
+                          )}
+                          disabled={loading || currentPage <= 1}
+                          onClick={() => goToPage(currentPage - 1)}
+                        >
+                          Previous
+                        </Button>
+                        <Button
+                          type="button"
+                          variant="none"
+                          effect="fill"
+                          size="sm"
+                          className={cn(
+                            CONNECT_PAGER_BUTTON_CLASSNAME,
+                            "min-w-[56px]"
+                          )}
+                          disabled={loading || !hasMore}
+                          onClick={() => goToPage(currentPage + 1)}
+                        >
+                          Next
+                        </Button>
+                      </div>
                       {/* The directory reports only whether more exists, never
                           a total, so this names the page rather than claiming
                           "3 of 12" — a total the surface cannot stand behind. */}
                       <span
-                        className="text-xs tabular-nums text-muted-foreground"
+                        className="ui-text-helper-text tabular-nums text-[color:var(--app-secondary-label)]"
                         aria-live="polite"
                       >
                         Page {currentPage}
                       </span>
-                      <Button
-                        type="button"
-                        variant="none"
-                        effect="fill"
-                        size="sm"
-                        disabled={loading || !hasMore}
-                        onClick={() => goToPage(currentPage + 1)}
-                      >
-                        Next
-                      </Button>
                     </div>
                   </div>
                 ) : null}
@@ -929,7 +1515,7 @@ export default function ConnectPageClient() {
                     >
                       {isConnectingMultiple
                         ? "Sending requests…"
-                        : `Connect to Selected (${selectedUserIds.size})`}
+                        : `Connect to Selected (${selectedUserIds.size}/${MAX_BULK_CONNECTION_REQUESTS})`}
                     </Button>
                   </div>
                 )}

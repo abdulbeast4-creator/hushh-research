@@ -18,6 +18,10 @@ from typing import Any, Callable
 from sqlalchemy import text
 
 from db.db_client import get_db
+from hushh_mcp.services.connection_graph_service import (
+    ORIGIN_DIRECT_REQUEST,
+    ensure_connection_origin,
+)
 from hushh_mcp.services.feed_service import FeedService
 
 logger = logging.getLogger(__name__)
@@ -147,6 +151,28 @@ class ConnectionsService:
             return [self._row_mapping(row) for row in result.fetchall()]
         result = get_db().execute_raw(sql, params or {})
         return result.data or []
+
+    def _display_name_for(self, user_id: str) -> str | None:
+        """Best-effort full display name for a user, for feed copy only.
+
+        Reads the same `actor_identity_cache.display_name` the connection and
+        directory queries already surface, so this never widens what the app
+        exposes about a mutual connection. Returns None when unresolved, letting
+        the feed fall back to its safe generic line.
+        """
+        uid = (user_id or "").strip()
+        if not uid:
+            return None
+        try:
+            row = self._execute_one(
+                "SELECT display_name FROM actor_identity_cache WHERE user_id = :uid",
+                {"uid": uid},
+            )
+        except Exception:  # noqa: BLE001 - name is cosmetic; never break the action
+            logger.exception("connections.feed_display_name_lookup_failed")
+            return None
+        name = str((row or {}).get("display_name") or "").strip()
+        return name or None
 
     @staticmethod
     def _row_mapping(row: Any) -> dict[str, Any]:
@@ -927,6 +953,34 @@ class ConnectionsService:
 
     @staticmethod
     def _canonical_pair(x: str, y: str) -> tuple[str, str]:
+        """Order a pair the way `connections_canonical_order` will judge it.
+
+        The table declares `CHECK (user_a_id < user_b_id)`, and that `<` is
+        evaluated by Postgres under the database collation -- `en_US.UTF8`,
+        which compares case-insensitively at the primary level. Python's `<` is
+        bytewise, so every uppercase letter sorts before every lowercase one.
+        The two disagree, and they disagreed silently:
+
+            'RPNmQAmVdlNz84GVfXxta50wnYx1' < 'oGltkj09rMcRnru7sBvfziC94px1'
+            Python   -> True          Postgres -> False
+
+        A pair ordered by Python and then inserted was rejected outright with
+        CheckViolation, so accepting a connection failed whenever two Firebase
+        UIDs differed in case at the first distinguishing character -- roughly
+        half of all pairs, forever. It read as intermittent because the other
+        half worked, and the route logged nothing, so the only symptom was
+        "That didn't go through. Try again." Measured on UAT: 88 of 390 pending
+        requests could never have been accepted.
+
+        Note the survivorship trap in the data. Every row in `connections`
+        agrees with Python's ordering, which looks like proof the code is fine.
+        It is the opposite: the disagreeing pairs were refused at INSERT, so
+        they were never written.
+
+        Ordering is therefore delegated to the database, which owns the
+        constraint. Reproducing a collation in Python would only recreate the
+        same drift the moment the database's collation changed.
+        """
         return (x, y) if x < y else (y, x)
 
     def _notify_new_request(self, addressee_user_id: str, requester_user_id: str) -> None:
@@ -1432,17 +1486,62 @@ class ConnectionsService:
                 )
 
             requester = str(req.get("requester_user_id"))
-            user_a, user_b = self._canonical_pair(requester, user_id)
+            # The statement that must satisfy `connections_canonical_order`
+            # decides the order itself, and reports back what it chose.
+            #
+            # Ordering the pair in Python and inserting the result is what
+            # broke: `CHECK (user_a_id < user_b_id)` is evaluated by Postgres
+            # under en_US.UTF8, which compares case-insensitively, while
+            # Python's `<` is bytewise and puts every uppercase letter first.
+            # For 'RPNmQ...' and 'oGltkj...' they disagree, the insert was
+            # rejected with CheckViolation, and accepting a connection failed
+            # for roughly half of all real UID pairs -- 88 of 390 pending
+            # requests on UAT, silently, because this route logged nothing.
+            #
+            # LEAST/GREATEST is the same comparison the constraint uses, in the
+            # same statement, so the two cannot drift apart again. RETURNING
+            # the columns means the canonical values used downstream are the
+            # ones actually stored rather than a second guess at them.
             connection = self._execute_one(
                 """
                 INSERT INTO connections (user_a_id, user_b_id, status, source, created_at, updated_at)
-                VALUES (:a, :b, 'active', 'request', NOW(), NOW())
+                VALUES (LEAST(:a, :b), GREATEST(:a, :b), 'active', 'request', NOW(), NOW())
                 ON CONFLICT (user_a_id, user_b_id) DO UPDATE SET
                   status = 'active', revoked_at = NULL, updated_at = NOW()
-                RETURNING id
+                RETURNING id, user_a_id, user_b_id
                 """,
-                {"a": user_a, "b": user_b},
+                {"a": requester, "b": user_id},
             )
+            # Prefer what the row actually stores, and fall back to the raw
+            # pair if RETURNING gave nothing. The fallback is safe because
+            # `ensure_connection_origin` canonicalises again on its own, so the
+            # worst case is passing the pair the other way round -- never a
+            # mis-ordered origin, and never the empty strings that a bare
+            # `.get()` would hand it.
+            user_a = str((connection or {}).get("user_a_id") or "") or requester
+            user_b = str((connection or {}).get("user_b_id") or "") or user_id
+            # Location eligibility needs BOTH an active `connections` row and
+            # an active non-circle origin. Acceptance wrote only the first, so
+            # a person could be connected in Connect and simply absent from
+            # Location's recipient list -- surfacing as "nobody in your
+            # connections matches that name" about someone plainly there, and
+            # leaving "connect with X, then share my location with X" broken at
+            # a step that looked like it had succeeded.
+            #
+            # Recorded through the graph service that owns origins rather than
+            # by writing the table here, and inside the same transaction that
+            # activates the connection, so the two can never disagree. The
+            # helper is idempotent, which matters because acceptance is
+            # retryable.
+            graph_connection = getattr(self, "_transaction_connection", None)
+            if graph_connection is not None:
+                ensure_connection_origin(
+                    graph_connection,
+                    user_a_id=user_a,
+                    user_b_id=user_b,
+                    kind=ORIGIN_DIRECT_REQUEST,
+                    source_ref=str(req.get("id") or "") or None,
+                )
             # Mirror both directional trusted edges so location/SOS readers keep working.
             self._mirror_trusted_edge(requester, user_id)
             self._mirror_trusted_edge(user_id, requester)
@@ -1467,14 +1566,39 @@ class ConnectionsService:
         # caller to retry an already-authorized connection transition.
         for owner, counterpart in ((user_id, requester), (requester, user_id)):
             try:
+                counterpart_metadata: dict[str, Any] = {"counterpart_user_id": counterpart}
+                counterpart_name = self._display_name_for(counterpart)
+                if counterpart_name:
+                    counterpart_metadata["counterpart_label"] = counterpart_name
                 FeedService().record_event(
                     user_id=owner,
                     source_domain="connections",
                     event_type="connection_accepted",
-                    metadata={"counterpart_user_id": counterpart},
+                    metadata=counterpart_metadata,
                 )
             except Exception:  # noqa: BLE001 - feed projection cannot roll back consent
                 logger.exception("connections.accepted_feed_projection_failed")
+
+        # Auto-share hook: a newly accepted connection makes both people
+        # mutually location-eligible. Honor each account persisted Auto-share
+        # flag. Best-effort, post-commit: the connection is already durable so
+        # an auto-share failure never undoes it. Gated per owner inside
+        # auto_start_share_for_new_peer, and only ever creates the
+        # metadata.source=auto_share grant a later toggle-off tears down.
+        try:
+            from hushh_mcp.services.one_location_agent_service import (
+                OneLocationAgentService,
+            )
+
+            location_service = OneLocationAgentService()
+            location_service.auto_start_share_for_new_peer(
+                owner_user_id=user_id, peer_user_id=requester
+            )
+            location_service.auto_start_share_for_new_peer(
+                owner_user_id=requester, peer_user_id=user_id
+            )
+        except Exception:  # noqa: BLE001 - auto-share cannot roll back the connection
+            logger.warning("connections.accepted_auto_share_failed", exc_info=True)
         return {
             "status": "accepted",
             "requestId": req.get("id"),
@@ -1515,16 +1639,17 @@ class ConnectionsService:
                 "No claimed circle invite for this peer.",
                 status_code=403,
             )
-        user_a, user_b = self._canonical_pair(user_id, peer_user_id)
+        # Same ordering hazard as `accept_request`, same fix: the statement that
+        # the CHECK judges is the statement that picks the order.
         conn = self._execute_one(
             """
             INSERT INTO connections (user_a_id, user_b_id, status, source, created_at, updated_at)
-            VALUES (:a, :b, 'active', 'circle_invite', NOW(), NOW())
+            VALUES (LEAST(:a, :b), GREATEST(:a, :b), 'active', 'circle_invite', NOW(), NOW())
             ON CONFLICT (user_a_id, user_b_id) DO UPDATE SET
               status = 'active', revoked_at = NULL, updated_at = NOW()
             RETURNING id
             """,
-            {"a": user_a, "b": user_b},
+            {"a": user_id, "b": peer_user_id},
         )
         # Mirror both directional trusted edges (parity with accept_request) so
         # location/SOS readers treat this as a full mutual connection.
@@ -1557,11 +1682,15 @@ class ConnectionsService:
             )
             requester = str(req.get("requester_user_id"))
         try:
+            rejected_metadata: dict[str, Any] = {"counterpart_user_id": user_id}
+            rejected_name = self._display_name_for(user_id)
+            if rejected_name:
+                rejected_metadata["counterpart_label"] = rejected_name
             FeedService().record_event(
                 user_id=requester,
                 source_domain="connections",
                 event_type="connection_rejected",
-                metadata={"counterpart_user_id": user_id},
+                metadata=rejected_metadata,
             )
         except Exception:  # noqa: BLE001 - projection cannot roll back rejection
             logger.exception("connections.rejected_feed_projection_failed")
@@ -1827,16 +1956,26 @@ class ConnectionsService:
                 {"id": (connection_id or "").strip()},
             )
         if conn:
+            user_a_id = str(user_a or "")
+            user_b_id = str(user_b or "")
+            user_a_name = self._display_name_for(user_a_id)
+            user_b_name = self._display_name_for(user_b_id)
+            a_metadata: dict[str, Any] = {"counterpart_user_id": user_b_id}
+            if user_b_name:
+                a_metadata["counterpart_label"] = user_b_name
+            b_metadata: dict[str, Any] = {"counterpart_user_id": user_a_id}
+            if user_a_name:
+                b_metadata["counterpart_label"] = user_a_name
             FeedService().record_event(
-                user_id=user_a,
+                user_id=user_a_id,
                 source_domain="connections",
                 event_type="connection_revoked",
-                metadata={"counterpart_user_id": user_b},
+                metadata=a_metadata,
             )
             FeedService().record_event(
-                user_id=user_b,
+                user_id=user_b_id,
                 source_domain="connections",
                 event_type="connection_revoked",
-                metadata={"counterpart_user_id": user_a},
+                metadata=b_metadata,
             )
         return {"removed": 1 if conn else 0}

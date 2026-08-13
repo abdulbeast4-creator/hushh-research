@@ -84,6 +84,42 @@ class CrmUpdateIntentRequest(BaseModel):
     )
 
 
+class CrmEncryptedFieldsReadRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    object_type: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("objectType", "object_type"),
+        max_length=80,
+    )
+    return_fields: list[str] = Field(
+        validation_alias=AliasChoices("returnFields", "return_fields"),
+        min_length=1,
+        max_length=128,
+    )
+    encrypted_fields: dict[str, Any] = Field(
+        validation_alias=AliasChoices("encryptedFields", "encrypted_fields")
+    )
+
+
+class CrmEncryptedFieldsUpdateIntentRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    object_type: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("objectType", "object_type"),
+        max_length=80,
+    )
+    field_names: list[str] = Field(
+        validation_alias=AliasChoices("fieldNames", "field_names"),
+        min_length=1,
+        max_length=128,
+    )
+    encrypted_fields: dict[str, Any] = Field(
+        validation_alias=AliasChoices("encryptedFields", "encrypted_fields")
+    )
+
+
 class CrmDeleteRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
@@ -114,6 +150,15 @@ def _schema_mapping_crm_id(*, service: Any, system_id: str) -> str:
     """
     system = service.get_system(system_id)
     return str(system.registry_id or system.system_id)
+
+
+def _operation_object_type(*, service: Any, system_id: str, operation: str) -> str:
+    """Registry, not the browser, owns the CRM object used by each action."""
+    system = service.get_system(system_id)
+    resolver = getattr(system, "object_type_for_operation", None)
+    if callable(resolver):
+        return str(resolver(operation))
+    return str(getattr(system, "object_type_default", "Contact"))
 
 
 async def _resolve_schema_mapping(
@@ -278,8 +323,11 @@ async def read_connected_system_record(
 ):
     service = get_connected_systems_service()
     try:
+        read_object_type = _operation_object_type(
+            service=service, system_id=system_id, operation="read"
+        )
         await _require_schema_mapping(
-            service=service, system_id=system_id, object_type=body.object_type
+            service=service, system_id=system_id, object_type=read_object_type
         )
         # A direct record read is binding-only. Browser lookup fields are not
         # forwarded, so an authenticated user cannot turn this endpoint into an
@@ -287,7 +335,7 @@ async def read_connected_system_record(
         return await service.read_bound_record(
             user_id=_user_id(token_data),
             system_id=system_id,
-            object_type=body.object_type,
+            object_type=read_object_type,
             return_fields=body.return_fields,
         )
     except ConnectedSystemsError as error:
@@ -310,6 +358,71 @@ async def get_connected_system_record_binding(
             user_id=_user_id(token_data),
             system_id=system_id,
             object_type=object_type,
+        )
+    except ConnectedSystemsError as error:
+        _raise_connected_system_error(error)
+
+
+@router.get("/{system_id}/encrypted-fields/config")
+async def get_connected_system_encrypted_fields_config(
+    system_id: str = Path(..., min_length=1, max_length=128),
+    token_data: dict = Depends(require_vault_owner_token),
+):
+    _ = _user_id(token_data)
+    try:
+        return get_connected_systems_service().crm_encrypted_fields_configuration(
+            system_id=system_id
+        )
+    except ConnectedSystemsError as error:
+        _raise_connected_system_error(error)
+
+
+@router.post("/{system_id}/records/read-encrypted")
+async def read_connected_system_record_encrypted_fields(
+    body: CrmEncryptedFieldsReadRequest,
+    system_id: str = Path(..., min_length=1, max_length=128),
+    token_data: dict = Depends(require_vault_owner_token),
+):
+    service = get_connected_systems_service()
+    try:
+        read_object_type = _operation_object_type(
+            service=service, system_id=system_id, operation="read"
+        )
+        await _require_schema_mapping(
+            service=service, system_id=system_id, object_type=read_object_type
+        )
+        return await service.read_bound_record_encrypted_fields(
+            user_id=_user_id(token_data),
+            system_id=system_id,
+            object_type=read_object_type,
+            return_fields=body.return_fields,
+            encrypted_fields=body.encrypted_fields,
+        )
+    except ConnectedSystemsError as error:
+        _raise_connected_system_error(error)
+
+
+@router.post("/{system_id}/records/update-intents-encrypted")
+async def update_connected_system_record_intent_encrypted_fields(
+    body: CrmEncryptedFieldsUpdateIntentRequest,
+    system_id: str = Path(..., min_length=1, max_length=128),
+    token_data: dict = Depends(require_vault_owner_token),
+):
+    service = get_connected_systems_service()
+    try:
+        update_object_type = _operation_object_type(
+            service=service, system_id=system_id, operation="update"
+        )
+        mapping = await _require_schema_mapping(
+            service=service, system_id=system_id, object_type=update_object_type
+        )
+        return await service.create_encrypted_fields_update_intent(
+            user_id=_user_id(token_data),
+            system_id=system_id,
+            object_type=update_object_type,
+            field_names=body.field_names,
+            encrypted_fields=body.encrypted_fields,
+            locked_field_names=set(mapping.values()),
         )
     except ConnectedSystemsError as error:
         _raise_connected_system_error(error)
@@ -344,8 +457,11 @@ async def search_connected_system_record(
 ):
     service = get_connected_systems_service()
     try:
+        read_object_type = _operation_object_type(
+            service=service, system_id=system_id, operation="read"
+        )
         await _require_schema_mapping(
-            service=service, system_id=system_id, object_type=body.object_type
+            service=service, system_id=system_id, object_type=read_object_type
         )
         # Lookup is strictly derived from the authenticated user's server-side
         # verified email and phone claim. The public request contains no
@@ -353,7 +469,7 @@ async def search_connected_system_record(
         return await service.search_verified_record(
             user_id=_user_id(token_data),
             system_id=system_id,
-            object_type=body.object_type,
+            object_type=read_object_type,
             return_fields=body.return_fields,
             force_refresh=body.force_refresh,
         )
@@ -369,8 +485,11 @@ async def create_connected_system_record_intent(
 ):
     service = get_connected_systems_service()
     try:
+        create_object_type = _operation_object_type(
+            service=service, system_id=system_id, operation="create"
+        )
         mapping = await _require_schema_mapping(
-            service=service, system_id=system_id, object_type=body.object_type
+            service=service, system_id=system_id, object_type=create_object_type
         )
         # Initial records contain only server-side verified identity values
         # mapped to this CRM's active schema. Client supplied values cannot
@@ -379,7 +498,7 @@ async def create_connected_system_record_intent(
             return await service.create_record_intent_for_verified_user(
                 user_id=_user_id(token_data),
                 system_id=system_id,
-                object_type=body.object_type,
+                object_type=create_object_type,
                 profile_field_mappings=mapping,
             )
         except ConnectedSystemValidationError as error:
@@ -392,23 +511,20 @@ async def create_connected_system_record_intent(
                 "CONNECTED_SYSTEM_SCHEMA_REQUIRED_FIELDS",
             }:
                 raise
-            configured_object_type = str(
-                body.object_type or service.get_system(system_id).object_type_default
-            )
             get_crm_schema_mapping_service().invalidate(
                 crm_id=system_id,
-                object_type=configured_object_type,
+                object_type=create_object_type,
             )
             mapping = await _require_schema_mapping(
                 service=service,
                 system_id=system_id,
-                object_type=body.object_type,
+                object_type=create_object_type,
                 force_refresh=True,
             )
             return await service.create_record_intent_for_verified_user(
                 user_id=_user_id(token_data),
                 system_id=system_id,
-                object_type=body.object_type,
+                object_type=create_object_type,
                 profile_field_mappings=mapping,
             )
     except ConnectedSystemsError as error:
@@ -423,13 +539,16 @@ async def update_connected_system_record_intent(
 ):
     service = get_connected_systems_service()
     try:
+        update_object_type = _operation_object_type(
+            service=service, system_id=system_id, operation="update"
+        )
         mapping = await _require_schema_mapping(
-            service=service, system_id=system_id, object_type=body.object_type
+            service=service, system_id=system_id, object_type=update_object_type
         )
         return await service.update_record_intent_from_fields(
             user_id=_user_id(token_data),
             system_id=system_id,
-            object_type=body.object_type,
+            object_type=update_object_type,
             # The route never selects a CRM id. The service resolves the
             # authenticated owner's active binding and rejects any mismatch.
             record_id=None,
@@ -453,15 +572,18 @@ async def delete_connected_system_record(
 ):
     service = get_connected_systems_service()
     try:
+        delete_object_type = _operation_object_type(
+            service=service, system_id=system_id, operation="delete"
+        )
         await _require_schema_mapping(
-            service=service, system_id=system_id, object_type=body.object_type
+            service=service, system_id=system_id, object_type=delete_object_type
         )
         # Compatibility route: delete is now a pending intent. Keeping this
         # URL prevents older clients from issuing an immediate destructive call.
         return service.create_delete_intent(
             user_id=_user_id(token_data),
             system_id=system_id,
-            object_type=body.object_type,
+            object_type=delete_object_type,
             record_id=None,
         )
     except ConnectedSystemsError as error:
@@ -476,13 +598,16 @@ async def create_connected_system_delete_intent(
 ):
     service = get_connected_systems_service()
     try:
+        delete_object_type = _operation_object_type(
+            service=service, system_id=system_id, operation="delete"
+        )
         await _require_schema_mapping(
-            service=service, system_id=system_id, object_type=body.object_type
+            service=service, system_id=system_id, object_type=delete_object_type
         )
         return service.create_delete_intent(
             user_id=_user_id(token_data),
             system_id=system_id,
-            object_type=body.object_type,
+            object_type=delete_object_type,
             record_id=None,
         )
     except ConnectedSystemsError as error:
@@ -502,6 +627,20 @@ async def approve_connected_system_intent(
             user_id=_user_id(token_data),
             system_id=system_id,
             intent_id=intent_id,
+        )
+    except ConnectedSystemsError as error:
+        _raise_connected_system_error(error)
+
+
+@router.post("/{system_id}/intents/{intent_id}/approve-encrypted")
+async def approve_connected_system_encrypted_fields_intent(
+    system_id: str = Path(..., min_length=1, max_length=128),
+    intent_id: str = Path(..., min_length=1, max_length=128),
+    token_data: dict = Depends(require_vault_owner_token),
+):
+    try:
+        return await get_connected_systems_service().approve_encrypted_fields_intent(
+            user_id=_user_id(token_data), system_id=system_id, intent_id=intent_id
         )
     except ConnectedSystemsError as error:
         _raise_connected_system_error(error)

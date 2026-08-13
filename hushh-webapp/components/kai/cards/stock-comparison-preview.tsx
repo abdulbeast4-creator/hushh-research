@@ -111,13 +111,20 @@ export function StockComparisonPreview({
             accent="default"
             actions={
               onBrowseRecommendations || onChangeStock ? (
-                <div className="flex items-center gap-1">
+                // Both action pills must stay fully visible on narrow iOS
+                // widths. `flex-nowrap` previously let "Change stock" overflow
+                // and clip off the card's right edge (see bug report). Allow the
+                // row to WRAP the second pill onto a new line instead of
+                // clipping it, and give the group full width so it aligns left
+                // under the title on phones and right on wider screens.
+                <div className="flex w-full flex-wrap items-center justify-start gap-1.5 sm:w-auto sm:justify-end">
                   {onBrowseRecommendations ? (
                     <Button
                       type="button"
                       variant="none"
                       effect="fade"
                       size="sm"
+                      className="min-w-0 whitespace-nowrap px-2.5 text-xs sm:text-sm"
                       onClick={onBrowseRecommendations}
                     >
                       Recommendations
@@ -129,9 +136,10 @@ export function StockComparisonPreview({
                       variant="none"
                       effect="fade"
                       size="sm"
+                      className="min-w-0 whitespace-nowrap px-2.5 text-xs sm:text-sm"
                       onClick={onChangeStock}
                     >
-                      <Search className="mr-1.5 h-3.5 w-3.5" aria-hidden="true" />
+                      <Search className="mr-1 h-3.5 w-3.5 shrink-0" aria-hidden="true" />
                       Change stock
                     </Button>
                   ) : null}

@@ -30,6 +30,9 @@ export const ROUTE_ID_VALUES = [
   "profile_access",
   "profile_access_connection",
   "profile_connected_systems",
+  "profile_integrations",
+  "profile_google_oauth_return",
+  "one_calendar",
   "profile_gmail",
   "profile_gmail_connection",
   "profile_gmail_actions",
@@ -57,6 +60,7 @@ export const ROUTE_ID_VALUES = [
   "one_marketplace",
   "one_location",
   "one_location_map",
+  "one_location_check_in",
   "one_location_public_request",
   "one_location_circle_invite",
   "one_location_circle_join",
@@ -141,6 +145,17 @@ export function resolveRouteId(pathname: string): RouteId {
     return "profile_access_connection";
   if (pathname === ROUTES.PROFILE_CONNECTED_SYSTEMS)
     return "profile_connected_systems";
+  if (pathname === ROUTES.PROFILE_INTEGRATIONS) return "profile_integrations";
+  // Both the /one-prefixed route and the bare legacy path land here; an OAuth
+  // return that falls through to "unknown" logs a raw pathname carrying
+  // provider state, which is the same reasoning as the Gmail return below.
+  if (
+    pathname === ROUTES.PROFILE_GOOGLE_OAUTH_RETURN ||
+    pathname === "/profile/google/oauth/return"
+  ) {
+    return "profile_google_oauth_return";
+  }
+  if (pathname === ROUTES.CALENDAR) return "one_calendar";
   if (pathname === ROUTES.PROFILE_GMAIL) return "profile_gmail";
   if (pathname === ROUTES.PROFILE_GMAIL_CONNECTION)
     return "profile_gmail_connection";
@@ -194,6 +209,9 @@ export function resolveRouteId(pathname: string): RouteId {
   }
   if (pathname === ROUTES.ONE_KYC) return "one_kyc";
   if (pathname === ROUTES.ONE_LOCATION_MAP) return "one_location_map";
+  // Its own id rather than the map's: these are separate screens now, and
+  // folding them together would hide the split from every page-view metric.
+  if (pathname === ROUTES.ONE_LOCATION_CHECK_IN) return "one_location_check_in";
   if (pathname === ROUTES.ONE_LOCATION) return "one_location";
   if (pathname.startsWith("/one/location/request/"))
     return "one_location_public_request";
@@ -724,6 +742,10 @@ const API_TEMPLATE_RULES: Array<{ regex: RegExp; template: string }> = [
   {
     regex: /^\/api\/iam\/marketplace\/opt-in(?:\?.*)?$/i,
     template: "/api/iam/marketplace/opt-in",
+  },
+  {
+    regex: /^\/api\/iam\/contact-discoverability(?:\?.*)?$/i,
+    template: "/api/iam/contact-discoverability",
   },
   {
     regex: /^\/api\/ria\/onboarding\/submit(?:\?.*)?$/i,

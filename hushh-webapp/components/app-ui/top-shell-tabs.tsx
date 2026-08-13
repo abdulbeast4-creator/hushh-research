@@ -1,6 +1,13 @@
 "use client";
 
-import { useCallback, useMemo, useRef, type CSSProperties } from "react";
+import {
+  useCallback,
+  useEffect,
+  useState,
+  useMemo,
+  useRef,
+  type CSSProperties,
+} from "react";
 import { useRouter } from "next/navigation";
 
 import type { TopShellTabSet } from "@/lib/navigation/top-shell-tabs";
@@ -70,6 +77,31 @@ export function TopShellTabs({
   const tabSwipeState = useTopShellTabSwipeState(tabSet.id);
   const indicatorTransform = `translate3d(calc(var(${topShellTabSwipePositionVariable(tabSet.id)}, ${activeIndex}) * 100%), 0, 0)`;
 
+  const textRefs = useRef<Array<HTMLSpanElement | null>>([]);
+  const [activeTextWidth, setActiveTextWidth] = useState(0);
+
+  useEffect(() => {
+    const activeTextSpan = textRefs.current[activeIndex];
+    if (activeTextSpan) {
+      setActiveTextWidth(activeTextSpan.offsetWidth);
+    }
+  }, [activeIndex, tabSet.tabs.length]);
+
+  // Keep the shared swipe-position variable in sync with the committed active
+  // tab. Taps go through `selectIndex`, which already snaps the indicator, but
+  // when the active tab changes by any other path -- a deep link like
+  // `?tab=history`, a back/forward navigation, or external route state -- the
+  // persisted position variable can retain the PREVIOUS index. The transform
+  // only falls back to `activeIndex` while that variable is unset, so a stale
+  // value would leave the underline resting under the wrong tab until the next
+  // tap. Re-sync here (never mid-drag) so the resting indicator always matches
+  // the selected tab. Inert during drags and no-op when already aligned.
+  useEffect(() => {
+    if (tabSwipeState.isDragging) return;
+    if (Math.abs(tabSwipeState.position - activeIndex) < 0.001) return;
+    setTopShellTabSwipeState(tabSet.id, activeIndex, false);
+  }, [activeIndex, tabSet.id, tabSwipeState.isDragging, tabSwipeState.position]);
+
   const selectIndex = useCallback(
     (index: number, focus: boolean) => {
       const tab = tabSet.tabs[index];
@@ -101,6 +133,7 @@ export function TopShellTabs({
   return (
     <div
       className="top-shell-ambient-ink relative flex h-[var(--top-tabs-h)] w-full items-center text-current"
+      data-ui-role="agent-tab-bar"
       data-top-shell-tab-set={tabSet.id}
       style={
         {
@@ -124,6 +157,7 @@ export function TopShellTabs({
               id={topShellTabDomId(tabSet, "tab", tab.value)}
               type="button"
               role="tab"
+              data-ui-role="agent-tab"
               data-voice-control-id={
                 tabSet.id === "ria" ? `ria_route_tab_${tab.value}` : undefined
               }
@@ -153,11 +187,15 @@ export function TopShellTabs({
               }}
             >
               <span
+                ref={(node) => {
+                  textRefs.current[index] = node;
+                }}
+                data-ui-role="agent-tab-label"
                 className={cn(
-                  "ui-text-form-label relative truncate transition-colors duration-150",
+                  "ui-text-agent-tab-label relative truncate transition-colors duration-150",
                   isActive
-                    ? "font-semibold text-current"
-                    : "font-normal text-[color:var(--app-secondary-label)] hover:text-current",
+                    ? "text-[color:var(--app-accent)]"
+                    : "text-[color:var(--app-label)] hover:text-current",
                 )}
               >
                 {tab.label}
@@ -180,7 +218,12 @@ export function TopShellTabs({
               width: tabWidth,
             }}
           >
-            <span className="h-[2.5px] w-[max(28px,calc(100%-2rem))] rounded-full bg-[var(--app-accent)]" />
+            <span
+              className="h-[3px] rounded-full bg-[var(--app-accent)] transition-[width] duration-150"
+              style={{
+                width: activeTextWidth ? `${Math.max(28, activeTextWidth)}px` : 'max(28px, calc(100% - 2rem))'
+              }}
+            />
           </div>
         ) : null}
       </div>

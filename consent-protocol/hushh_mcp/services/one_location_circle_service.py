@@ -886,6 +886,53 @@ class OneLocationCircleService:
         except Exception as exc:
             raise self._safe_db_failure("create_code", exc) from exc
 
+    def bootstrap_first_circle(
+        self,
+        *,
+        user_id: str,
+        name: str,
+    ) -> dict[str, Any]:
+        """Find-or-create the caller's own first Circle and return its live code.
+
+        Onboarding needs a shareable code before the vault exists, and the three
+        round trips the client used to make (list, create, mint) each required a
+        vault owner token. This composes them server-side so onboarding can ask
+        once, authenticated by Firebase alone.
+
+        Deliberately the narrowest possible surface: it takes no circle id, so it
+        can only ever act on a Circle the caller already owns or one it creates
+        for them, and it never rotates -- a caller who already owns a Circle gets
+        that Circle and the code it is already sharing. Every other Circle route
+        keeps its vault-owner gate.
+        """
+
+        owned = next(
+            (
+                circle
+                for circle in self.list_circles(user_id=user_id)
+                if str(circle.get("role") or "") == "owner"
+            ),
+            None,
+        )
+        circle = owned or self.create_circle(
+            owner_user_id=user_id,
+            name=name,
+            kind="family",
+        )
+        circle_id = str(circle.get("id") or "")
+        if not circle_id:
+            raise RuntimeError("Circle bootstrap resolved no circle id.")
+        invite = self.create_invite_code(
+            actor_user_id=user_id,
+            circle_id=circle_id,
+            rotate=False,
+        )
+        return {
+            "circleId": circle_id,
+            "circleName": str(circle.get("name") or name),
+            "code": str(invite.get("code") or ""),
+        }
+
     def resolve_invite_code(
         self,
         *,
@@ -1163,8 +1210,72 @@ class OneLocationCircleService:
                 redact_log_field("user_id", user_id),
                 joined,
             )
+            circle = self.get_circle(user_id=user_id, circle_id=circle_id)
+            if joined:
+                # Best effort, and deliberately after the transaction: the
+                # membership is already durable, so a push failure must never
+                # undo a join that succeeded. Sending inside the transaction
+                # would also notify on a row that could still roll back.
+                try:
+                    from hushh_mcp.services.push_notifications import (
+                        send_circle_code_joined_push,
+                    )
+
+                    inviter_user_id = str(invite_row.get("created_by_user_id") or "")
+                    # The joiner is now a member, so their display name is
+                    # already in the detail payload -- no second lookup, and no
+                    # raw identifier in a notification body.
+                    joiner_name = next(
+                        (
+                            str(member.get("displayName") or "").strip()
+                            for member in (circle.get("members") or [])
+                            if str(member.get("userId") or "") == user_id
+                        ),
+                        "",
+                    )
+                    if inviter_user_id and inviter_user_id != user_id:
+                        send_circle_code_joined_push(
+                            inviter_user_id=inviter_user_id,
+                            joiner_display_name=joiner_name or "Someone",
+                            circle_id=circle_id,
+                            circle_name=str(circle.get("name") or ""),
+                        )
+                except Exception:
+                    logger.warning(
+                        "one_location.circle_joined_push_failed circle=%s",
+                        circle_id,
+                        exc_info=True,
+                    )
+                # Auto-share hook. A fresh Circle join makes the joiner and
+                # every existing member mutually location-eligible. Honor
+                # each account persisted Auto-share flag. Best-effort and
+                # post-commit: membership is already durable, so a failure
+                # never undoes the join. Gated per owner inside
+                # auto_start_share_for_new_peer.
+                try:
+                    from hushh_mcp.services.one_location_agent_service import (
+                        OneLocationAgentService,
+                    )
+
+                    location_service = OneLocationAgentService()
+                    for member in circle.get("members") or []:
+                        member_user_id = str(member.get("userId") or "").strip()
+                        if not member_user_id or member_user_id == user_id:
+                            continue
+                        location_service.auto_start_share_for_new_peer(
+                            owner_user_id=user_id, peer_user_id=member_user_id
+                        )
+                        location_service.auto_start_share_for_new_peer(
+                            owner_user_id=member_user_id, peer_user_id=user_id
+                        )
+                except Exception:
+                    logger.warning(
+                        "one_location.circle_joined_auto_share_failed circle=%s",
+                        circle_id,
+                        exc_info=True,
+                    )
             return {
-                "circle": self.get_circle(user_id=user_id, circle_id=circle_id),
+                "circle": circle,
                 "joined": joined,
             }
         except OneLocationCircleError:
@@ -1960,6 +2071,7 @@ class OneLocationCircleService:
                     for invitee_user_id in cleaned_invitee_user_ids
                 ]
             if created_invite_ids:
+                from hushh_mcp.services.feed_service import FeedService
                 from hushh_mcp.services.push_notifications import (
                     send_circle_member_invite_push,
                 )
@@ -1974,6 +2086,25 @@ class OneLocationCircleService:
                         circle_id=cleaned_circle_id,
                         invite_id=str(payload.get("id") or ""),
                     )
+                    # Feed is a best-effort, post-commit projection: the
+                    # invitation itself is already durable in
+                    # one_location_circle_member_invites, so a feed-write
+                    # failure must never fail the invite that produced it.
+                    try:
+                        FeedService().record_event(
+                            user_id=str(payload.get("inviteeUserId") or ""),
+                            source_domain="location",
+                            event_type="circle_member_invited",
+                            actor_label=str(payload.get("inviterDisplayName") or "") or None,
+                            metadata={
+                                "invite_id": str(payload.get("id") or ""),
+                                "circle_id": cleaned_circle_id,
+                                "circle_name": str(payload.get("circleName") or ""),
+                                "inviter_user_id": actor_user_id,
+                            },
+                        )
+                    except Exception:  # noqa: BLE001 - projection cannot roll back the invite
+                        logger.exception("one_location.circle_member_invite_feed_projection_failed")
             logger.info(
                 "one_location.circle_members_invited actor=%s requested=%s created=%s",
                 redact_log_field("user_id", actor_user_id),

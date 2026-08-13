@@ -117,7 +117,17 @@
     "136_one_location_circle_member_invites.sql",
     "137_ria_claim_dossiers.sql",
     "138_circle_member_connection_origin.sql",
-    "139_ria_profile_brochure_provenance.sql"
+    "139_ria_profile_brochure_provenance.sql",
+    "140_one_contact_discoverability.sql",
+    "141_crm_zk_v1.sql",
+    "142_source_library_scope_retirement.sql",
+    "143_crm_zk_uat_v1.sql",
+    "144_google_integrations_calendar_foundation.sql",
+    "145_crm_encrypted_fields_v1.sql",
+    "146_crm_operation_object_binding.sql",
+    "147_retire_crm_zk_runtime_profiles.sql",
+    "148_nws_nearby_marketplace_actions.sql",
+    "149_external_crm_dynamic_registry.sql"
   ],
   "groups": {
     "iam": [
@@ -189,7 +199,17 @@
       "136_one_location_circle_member_invites.sql",
       "137_ria_claim_dossiers.sql",
       "138_circle_member_connection_origin.sql",
-      "139_ria_profile_brochure_provenance.sql"
+      "139_ria_profile_brochure_provenance.sql",
+      "140_one_contact_discoverability.sql",
+      "141_crm_zk_v1.sql",
+      "142_source_library_scope_retirement.sql",
+      "143_crm_zk_uat_v1.sql",
+      "144_google_integrations_calendar_foundation.sql",
+      "145_crm_encrypted_fields_v1.sql",
+      "146_crm_operation_object_binding.sql",
+      "147_retire_crm_zk_runtime_profiles.sql",
+      "148_nws_nearby_marketplace_actions.sql",
+      "149_external_crm_dynamic_registry.sql"
     ],
     "pkm": [
       "030_pkm_cutover.sql",
@@ -212,7 +232,8 @@
       "098_pkm_v7_recovery_foundation.sql",
       "123_pkm_device_sync.sql",
       "128_private_analysis_history_redaction.sql",
-      "129_ria_pick_legacy_retirement.sql"
+      "129_ria_pick_legacy_retirement.sql",
+      "142_source_library_scope_retirement.sql"
     ],
     "developer": [
       "070_developer_registry.sql",
@@ -225,7 +246,8 @@
       "105_agentforce_mcp_compatibility.sql",
       "106_agentforce_uat_profile.sql",
       "108_canonical_mcp_credentials.sql",
-      "109_oauth_client_credentials_consent_execution.sql"
+      "109_oauth_client_credentials_consent_execution.sql",
+      "142_source_library_scope_retirement.sql"
     ]
   }
 }

@@ -9,11 +9,13 @@ import {
   type ReactNode,
 } from "react";
 import { useRouter } from "next/navigation";
+import { toast } from "sonner";
 
 import {
   AppPageContentRegion,
   AppPageShell,
 } from "@/components/app-ui/app-page-shell";
+
 import { SectionLabel as AppSectionLabel } from "@/components/app-ui/typography";
 import { Button } from "@/lib/morphy-ux/button";
 import { useAuth } from "@/hooks/use-auth";
@@ -65,6 +67,32 @@ export function FeedPage() {
   const [loadMoreError, setLoadMoreError] = useState<string | null>(null);
   const markedReadRef = useRef(false);
   const paginationInitializedRef = useRef(false);
+  // Durable clear. There is no backend feed-delete endpoint yet, so "Clear"
+  // (a) marks everything read (which the server persists) and (b) records a
+  // per-user "cleared up to this timestamp" watermark in localStorage. Every
+  // load then hides items at or older than that watermark, so the cleared state
+  // survives tab switches and refreshes — anything genuinely NEWER than the last
+  // clear still shows. Replaces the old session-only boolean that reset on
+  // remount (the bug: switching tabs and back re-showed cleared notifications).
+  const [clearedAt, setClearedAt] = useState<string | null>(null);
+  const [clearing, setClearing] = useState(false);
+
+  const clearedStorageKey = user?.uid
+    ? `hushh:feed-cleared-at:${user.uid}`
+    : null;
+
+  // Hydrate the persisted watermark once the signed-in user is known. Reading in
+  // an effect (not the initializer) avoids any SSR/hydration mismatch, since the
+  // feed only renders meaningfully after auth resolves client-side.
+  useEffect(() => {
+    if (!clearedStorageKey) return;
+    try {
+      setClearedAt(window.localStorage.getItem(clearedStorageKey));
+    } catch {
+      // Storage can be disabled; fall back to no persisted clear.
+    }
+  }, [clearedStorageKey]);
+
 
   const { actionables } = useFeedActionables();
 
@@ -111,13 +139,23 @@ export function FeedPage() {
     // twice (duplicate React keys) if it reappears across the seam.
     const seen = new Set<string>();
     const merged: FeedItem[] = [];
+    // Drop anything at or older than the persisted "cleared" watermark so a
+    // prior Clear survives tab switches and refreshes.
+    const clearedMs = clearedAt ? new Date(clearedAt).getTime() : null;
     for (const item of [...(data?.items ?? []), ...additionalItems]) {
       if (seen.has(item.id)) continue;
+      if (
+        clearedMs !== null &&
+        Number.isFinite(clearedMs) &&
+        new Date(item.created_at).getTime() <= clearedMs
+      ) {
+        continue;
+      }
       seen.add(item.id);
       merged.push(item);
     }
     return merged;
-  }, [data, additionalItems]);
+  }, [data, additionalItems, clearedAt]);
   const error = resourceError
     ? "Feed could not be loaded right now."
     : loadMoreError;
@@ -145,6 +183,39 @@ export function FeedPage() {
     [router],
   );
 
+  const handleClearAll = useCallback(async () => {
+    if (!user || clearing) return;
+    setClearing(true);
+    try {
+      // Persist what the backend supports today: mark everything read so the
+      // unread badge is cleared durably. Hiding the history rows is
+      // session-scoped until a real feed-delete endpoint exists.
+      const idToken = await user.getIdToken();
+      const latestId = items[0]?.id;
+      await FeedService.markRead({ idToken, upToId: latestId ?? null });
+      dispatchFeedStateChanged();
+      setAdditionalItems([]);
+      setNextCursor(null);
+      // Persist the clear as a timestamp watermark so it survives tab
+      // switches and refreshes (the old session flag reset on remount).
+      const nowIso = new Date().toISOString();
+      setClearedAt(nowIso);
+      if (clearedStorageKey) {
+        try {
+          window.localStorage.setItem(clearedStorageKey, nowIso);
+        } catch {
+          // Storage disabled: clear still applies for this session.
+        }
+      }
+      toast.success("Feed notifications cleared");
+    } catch {
+      toast.error("Failed to clear feed notifications");
+    } finally {
+      setClearing(false);
+    }
+  }, [user, clearing, items, clearedStorageKey]);
+
+
   // Present strictly newest-first by wall-clock time, then club into day
   // sections. The backend paginates by row id (append-only), which normally
   // equals created_at order; sorting here keeps the feed correct even when it
@@ -157,8 +228,15 @@ export function FeedPage() {
     return groupItemsByDay(sorted);
   }, [items]);
   const hasActionables = actionables.length > 0;
+  // Once cleared this session, the loaded history rows are hidden even though
+  // `items` still holds them (no backend delete yet), so the empty state shows.
   const hasHistory = items.length > 0;
   const showEmpty = !loading && !hasActionables && !hasHistory && !error;
+  // The Clear affordance only makes sense when there is dismissable history
+  // showing. Actionables ("Needs you") are deliberately NOT cleared: they are
+  // pending tasks the user must still act on, not passive notifications.
+  const canClear = hasHistory;
+
 
   return (
     <AppPageShell as="main" width="reading" className="!px-0 pb-24 sm:pb-28">
@@ -192,7 +270,21 @@ export function FeedPage() {
 
           {showEmpty ? (
             <div role="status" className="px-4 py-16 text-center text-sm text-muted-foreground">
-              You're all caught up.
+              {clearedAt ? "No notifications yet." : "You're all caught up."}
+            </div>
+          ) : null}
+
+          {canClear ? (
+            <div className="flex justify-end px-[6px] pt-2">
+              <button
+                type="button"
+                onClick={() => void handleClearAll()}
+                disabled={clearing}
+                aria-label="Clear feed notifications"
+                className="rounded-full bg-destructive/10 px-3 py-1.5 text-xs font-semibold text-destructive transition-colors hover:bg-destructive/15 disabled:opacity-60"
+              >
+                {clearing ? "Clearing…" : "Clear"}
+              </button>
             </div>
           ) : null}
 
@@ -209,7 +301,7 @@ export function FeedPage() {
               ))
             : null}
 
-          {nextCursor ? (
+          {hasHistory && nextCursor ? (
             <div className="flex justify-center py-3">
               <Button
                 type="button"

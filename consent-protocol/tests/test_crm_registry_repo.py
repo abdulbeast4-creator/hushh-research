@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 
 import pytest
@@ -71,6 +72,7 @@ def _operation_rows() -> list[dict]:
             "crm_id": "salesforce-fsc-customer0",
             "operation": "read",
             "tool_name": "read-crm-record",
+            "crm_encrypted_fields_tool_name": "read-crm-record-encrypted",
             "http_method": None,
             "path": None,
             "description": "Read by email/phone.",
@@ -89,6 +91,7 @@ def _operation_rows() -> list[dict]:
             "crm_id": "salesforce-fsc-customer0",
             "operation": "update",
             "tool_name": "update-crm-record",
+            "crm_encrypted_fields_tool_name": "update-crm-record-encrypted",
             "http_method": None,
             "path": None,
             "description": "Update by id.",
@@ -258,8 +261,8 @@ def test_pbkdf2_row_missing_kdf_params_raises_configuration_error(monkeypatch):
         crm_registry_repo.load_active_definition("salesforce-fsc-customer0", db=db)
 
 
-def test_bearer_row_passes_tool_args_without_decrypt(monkeypatch):
-    """MuleSoft-owned Bearer rows pass client id/secret row values to the MCP tool."""
+def test_bearer_row_uses_gateway_headers_without_crm_configuration(monkeypatch):
+    """MuleSoft bearer rows never pass CRM config or OAuth values to a tool."""
     row = _pbkdf2_row()
     row["crm_id"] = "crm_001"
     row["crm_enterprise_name"] = "Macys"
@@ -284,15 +287,98 @@ def test_bearer_row_passes_tool_args_without_decrypt(monkeypatch):
         ("client_id", "gateway-client"),
         ("client_secret", "gateway-secret"),
     )
-    assert definition.transport_tool_arguments == {
-        "target": "Macys",
-        "crmBaseUrl": row["crm_base_url"],
-        "crmMcpEndpoint": row["crm_mcp_endpoint"],
-        "clientId": "plain-salesforce-client-id",
-        "clientSecret": "encrypted-salesforce-client-secret",
-        "crmTokenUrl": "",
-        "objectType": "Contact",
+    assert definition.transport_tool_arguments is None
+
+
+def test_bearer_row_needs_no_connector_ref(monkeypatch):
+    row = _pbkdf2_row()
+    row["auth_header_style"] = "Bearer"
+    db = _FakeDb([row], [])
+    monkeypatch.setenv("OMNIGATEWAY_CLIENT_ID", "gateway-client")
+    monkeypatch.setenv("OMNIGATEWAY_CLIENT_SECRET", "gateway-secret")
+
+    definition = crm_registry_repo.load_active_definition("salesforce-fsc-customer0", db=db)
+    assert definition is not None
+    assert definition.transport_tool_arguments is None
+
+
+def test_external_dynamic_registry_uses_isolated_gateway_and_server_only_crm_arguments(
+    monkeypatch,
+):
+    row = _pbkdf2_row()
+    row.update(
+        {
+            "auth_header_style": "Bearer",
+            "gateway_credential_profile": "external_crm",
+            "crm_connection_mode": "dynamic_registry",
+            "crm_connection_base_url": "https://api.salesforce.example/platform",
+            "crm_connection_mcp_endpoint": "/mcp/v1/sandbox/platform/sobject-all",
+            "crm_connection_token_url": "https://salesforce.example/oauth2/token",
+        }
+    )
+    monkeypatch.setattr(crm_registry_repo, "get_connector_secrets_key", lambda: CONNECTOR_PASSWORD)
+    monkeypatch.setenv("OMNIGATEWAY_CLIENT_ID", "shared-gateway-client")
+    monkeypatch.setenv("OMNIGATEWAY_CLIENT_SECRET", "shared-gateway-secret")
+    monkeypatch.setenv("OMNIGATEWAY_EXT_CRM_CLIENT_ID", "external-gateway-client")
+    monkeypatch.setenv("OMNIGATEWAY_EXT_CRM_CLIENT_SECRET", "external-gateway-secret")
+
+    definition = crm_registry_repo.load_active_definition(
+        "salesforce-fsc-customer0", db=_FakeDb([row], _operation_rows())
+    )
+
+    assert definition is not None
+    assert definition.transport_headers == (
+        ("client_id", "external-gateway-client"),
+        ("client_secret", "external-gateway-secret"),
+    )
+    expected = {
+        "target": "Macy's",
+        "crmBaseUrl": row["crm_connection_base_url"],
+        "crmMcpEndpoint": row["crm_connection_mcp_endpoint"],
+        "clientId": CLIENT_ID,
+        "clientSecret": CLIENT_SECRET,
+        "crmTokenUrl": row["crm_connection_token_url"],
     }
+    assert definition.transport_tool_arguments == expected
+    assert definition.transport_replacement_tool_arguments == expected
+
+
+def test_encrypted_fields_bearer_row_uses_pinned_key(monkeypatch):
+    row = _pbkdf2_row()
+    row["auth_header_style"] = "Bearer"
+    row["crm_encrypted_fields_v1_enabled"] = True
+    key = {
+        "key_id": "mulesoft-uat-static-1",
+        "public_key": "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=",
+        "public_key_fingerprint": f"sha256:{hashlib.sha256(bytes([2]) * 32).hexdigest()}",
+        "environment": "sandbox",
+        "status": "active",
+    }
+
+    class EncryptedFieldsDb(_FakeDb):
+        def execute_raw(self, sql, params=None):
+            self.queries.append((sql, params))
+            if "crm_encrypted_fields_recipient_keys" in sql:
+                return _FakeQueryResult([key])
+            if "crm_operation_endpoints" in sql:
+                return _FakeQueryResult(list(self._operation_rows))
+            return _FakeQueryResult(list(self._registry_rows))
+
+    monkeypatch.setenv("OMNIGATEWAY_CLIENT_ID", "gateway-client")
+    monkeypatch.setenv("OMNIGATEWAY_CLIENT_SECRET", "gateway-secret")
+    definition = crm_registry_repo.load_active_definition(
+        "salesforce-fsc-customer0", db=EncryptedFieldsDb([row], _operation_rows())
+    )
+
+    assert definition is not None
+    assert definition.crm_encrypted_fields_v1_enabled is True
+    assert definition.crm_encrypted_fields_recipient_key == {
+        "keyId": key["key_id"],
+        "publicKey": key["public_key"],
+        "publicKeyFingerprint": key["public_key_fingerprint"],
+        "environment": "sandbox",
+    }
+    assert definition.transport_tool_arguments is None
 
 
 def test_load_active_definitions_lists_all_active_rows_without_decrypt(monkeypatch):

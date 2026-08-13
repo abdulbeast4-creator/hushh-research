@@ -29,11 +29,11 @@ import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { toast } from "sonner";
 
 import {
-  ChevronRight,
   Link as LinkIcon,
   Lock,
   Map,
   MapPin,
+  MessageCircleQuestionMark,
   Navigation,
   Plus,
   Send,
@@ -47,6 +47,11 @@ import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
 import { PageHeader } from "@/components/app-ui/page-sections";
+import {
+  RowDescription,
+  RowLabel,
+  SectionTitle,
+} from "@/components/app-ui/typography";
 import type {
   OneLocationAccessRequest,
   OneLocationCircleInvite,
@@ -72,7 +77,7 @@ import {
   TrustNoteCard,
   WarningCard,
 } from "./primitives";
-import { MUTED_TEXT, SECTION_HEADING, SUBCARD_SURFACE } from "./tokens";
+import { MUTED_TEXT, SUBCARD_SURFACE } from "./tokens";
 import {
   RequestCard,
   SharedWithMeCard,
@@ -164,6 +169,8 @@ export type LocationHubViewModel = {
   revokingGrantId: string | null;
   /** Bumped on each successful share so the hub can close the share flow. */
   shareCompletedTick: number;
+  /** Where a completed share should land, when not the clean hub. */
+  shareCompletedDestination?: string | null;
 
   /* device + self location */
   readiness: {
@@ -391,6 +398,10 @@ const FLOW_ACTION_PARAM = "action";
 const FLOW_SOURCE_PARAM = "source";
 const PRIVATE_CHECK_IN_ACTION = "private-check-in";
 const NEARBY_CHECK_IN_SOURCE = "nearby";
+// Emergency contacts is reachable from Settings AND from SOS, so its back arrow
+// cannot be a constant. Recording the opener in the URL keeps the in-content
+// arrow agreeing with the chrome and OS back buttons, which follow real history.
+const SOS_FLOW_SOURCE = "sos";
 
 const FLOW_TO_ACTION: Record<Exclude<FlowKind, "none">, string> = {
   share: "share",
@@ -408,6 +419,24 @@ const FLOW_TO_ACTION: Record<Exclude<FlowKind, "none">, string> = {
   "shared-with-me": "shared-with-me",
   "needs-review": "needs-review",
 };
+
+/**
+ * Where the Emergency-contacts back arrow goes.
+ *
+ * It has two openers -- Settings and SOS -- so a fixed target is wrong for one
+ * of them. This used to be hardcoded to Settings on the reasoning that contacts
+ * were "only ever opened from Settings"; the SOS entry point was added later and
+ * the assumption was never revisited, so anyone editing contacts mid-emergency
+ * was dropped out of the SOS flow.
+ *
+ * Settings stays the default: an unknown or absent source means the person did
+ * not arrive from SOS, and Settings is where the rest of the entry points live.
+ */
+export function resolveSmsContactsBackFlow(
+  source: string | null | undefined,
+): "sos" | "settings" {
+  return source === SOS_FLOW_SOURCE ? "sos" : "settings";
+}
 
 const RETIRED_ACTIONS = new Set([
   "drive-to",
@@ -510,18 +539,23 @@ function LocationHeaderActions({ vm }: { vm: LocationHubViewModel }) {
       className="ml-auto flex max-w-full shrink-0 items-center justify-end"
       data-testid="one-location-header-actions"
     >
-      <div className="flex h-9 shrink-0 items-center gap-0 rounded-full bg-black/[0.05] px-2 text-[13px] font-semibold text-foreground sm:gap-2 sm:px-3 dark:bg-white/[0.07]">
+      <div className="flex min-h-[31px] shrink-0 items-center gap-2 rounded-full bg-[color:var(--app-neutral-fill)] pl-3 pr-0">
         <span
-          className="hidden whitespace-nowrap sm:inline"
+          className="ui-text-helper-text hidden whitespace-nowrap text-[color:var(--app-label)] sm:inline"
           aria-hidden="true"
         >
           {statusLabel}
         </span>
         <Switch
+          size="ios"
           checked={locationOn}
           onCheckedChange={handleLocationChange}
           disabled={toggling || refreshing}
           aria-label={locationOn ? "Turn location off" : "Turn location on"}
+          // The same pair of contract actions the Settings toggle carries.
+          // Both are the same control in two places, so voice can offer
+          // pause/resume from the Now tab without opening Settings first.
+          data-voice-control-id="one-location-updates-toggle"
           // No colour override: the shared Switch already carries the iOS
           // system green, so this toggle reads the same as every other one.
           className={cn(toggling && "animate-pulse")}
@@ -546,6 +580,11 @@ export function LocationRedesignHub({ vm }: { vm: LocationHubViewModel }) {
   const nearbyPrivateCheckIn =
     searchParams.get(FLOW_ACTION_PARAM) === PRIVATE_CHECK_IN_ACTION &&
     searchParams.get(FLOW_SOURCE_PARAM) === NEARBY_CHECK_IN_SOURCE;
+  const smsContactsBackFlow = resolveSmsContactsBackFlow(
+    searchParams.get(FLOW_ACTION_PARAM) === FLOW_TO_ACTION["sms-contacts"]
+      ? searchParams.get(FLOW_SOURCE_PARAM)
+      : null,
+  );
   const nearbyReturnToken = searchParams.get(NEARBY_PRIVATE_RETURN_TOKEN_PARAM);
   const nearbyCheckInReturnHref =
     nearbyPrivateCheckIn && isNearbyPrivateReturnToken(nearbyReturnToken)
@@ -655,12 +694,18 @@ export function LocationRedesignHub({ vm }: { vm: LocationHubViewModel }) {
   // been removed from the flows — each action screen shows exactly one back
   // affordance plus its own Cancel/Done control.
   const openFlow = useCallback(
-    (next: Exclude<FlowKind, "none">) => {
+    (next: Exclude<FlowKind, "none">, source?: string) => {
       setFlow(next);
       activeFlowRef.current = next;
       pendingFlowRef.current = next;
       const params = new URLSearchParams(searchParams.toString());
-      params.delete(FLOW_SOURCE_PARAM);
+      // Carrying no source is the normal case and must clear a stale one,
+      // otherwise the previous flow's opener would be inherited by the next.
+      if (source) {
+        params.set(FLOW_SOURCE_PARAM, source);
+      } else {
+        params.delete(FLOW_SOURCE_PARAM);
+      }
       params.set(FLOW_ACTION_PARAM, FLOW_TO_ACTION[next]);
       router.push(`${pathname}?${params.toString()}`, { scroll: false });
     },
@@ -824,6 +869,14 @@ export function LocationRedesignHub({ vm }: { vm: LocationHubViewModel }) {
         router.replace(nearbyCheckInReturnHref, { scroll: false });
         return;
       }
+      // An authored landing wins over the clean-up below, and has to be
+      // decided HERE rather than pushed by the caller: this effect calls
+      // router.replace on the very next render, so anything the caller
+      // navigated to would simply be replaced away.
+      if (vm.shareCompletedDestination) {
+        router.replace(vm.shareCompletedDestination, { scroll: false });
+        return;
+      }
       // Drop the action param so the hub URL is clean after a completed share.
       if ((searchParams.get(FLOW_ACTION_PARAM) || "").trim()) {
         const params = new URLSearchParams(searchParams.toString());
@@ -835,6 +888,7 @@ export function LocationRedesignHub({ vm }: { vm: LocationHubViewModel }) {
     }
   }, [
     vm.shareCompletedTick,
+    vm.shareCompletedDestination,
     nearbyCheckInReturnHref,
     nearbyPrivateCheckIn,
     pathname,
@@ -878,7 +932,7 @@ export function LocationRedesignHub({ vm }: { vm: LocationHubViewModel }) {
           <SosFlow
             vm={vm}
             onClose={() => closeFlow("now")}
-            onEditContacts={() => openFlow("sms-contacts")}
+            onEditContacts={() => openFlow("sms-contacts", SOS_FLOW_SOURCE)}
           />
         ) : flow === "sms-contacts" ? (
           <SmsContactsFlow
@@ -886,10 +940,12 @@ export function LocationRedesignHub({ vm }: { vm: LocationHubViewModel }) {
             circles={vm.circles}
             selectedUserIds={vm.smsContactUserIds}
             busyKey={vm.busy}
-            // SMS contacts is only ever opened from Settings, so its in-content
-            // back arrow returns to Settings (not the default "Now" tab), which
-            // matches the chrome/OS back button behavior.
-            onBack={() => openFlow("settings")}
+            // Emergency contacts is opened from Settings and from SOS, so the
+            // back arrow follows whoever opened it rather than a fixed target.
+            // Sending someone from SOS back to Settings drops them out of the
+            // emergency flow they were in the middle of, which is the worst
+            // moment to make them find their way back.
+            onBack={() => openFlow(smsContactsBackFlow)}
             onAdd={vm.onAddSmsContact}
             onAddCircle={vm.onAddSmsCircle}
             onRemove={vm.onRemoveSmsContact}
@@ -980,15 +1036,12 @@ export function LocationRedesignHub({ vm }: { vm: LocationHubViewModel }) {
   /* Hub (Now | People | Links)                                        */
   /* ----------------------------------------------------------------- */
   return (
-    <div className="space-y-5">
+    <div className="space-y-4 sm:space-y-5">
       <PageHeader
-        title={
-          <span className="inline-flex h-9 items-center whitespace-nowrap">
-            Location Agent
-          </span>
-        }
+        title="Location Agent"
         icon={MapPin}
-        accent="neutral"
+        accent="location"
+        titleRole="agent"
         actionsInlineMobile
         actions={<LocationHeaderActions vm={vm} />}
       />
@@ -1001,6 +1054,7 @@ export function LocationRedesignHub({ vm }: { vm: LocationHubViewModel }) {
           options={LOCATION_SWIPE_OPTIONS}
           onSelectionChange={(value) => setTab(value as LocationHubTab)}
           viewportMinHeight="0px"
+          heightMode="active"
         >
           <LocationHubPanel>
             <NowHub
@@ -1053,7 +1107,7 @@ export function LocationRedesignHub({ vm }: { vm: LocationHubViewModel }) {
 
 function LocationHubPanel({ children }: { children: ReactNode }) {
   return (
-    <div className="space-y-5 px-[var(--page-inline-gutter-standard)]">
+    <div className="space-y-4 px-[var(--page-inline-gutter-standard)]">
       {children}
     </div>
   );
@@ -1089,7 +1143,7 @@ function NowHub({
   onOpenSettings: () => void;
 }) {
   return (
-    <div className="space-y-3" data-testid="one-location-now-hub">
+    <div className="space-y-4" data-testid="one-location-now-hub">
       {/* Every row and tile below carries the `control_ids` / `action_id` pair
           it was authored with in the Location voice action contract, so One and
           the search bar can name the individual control a person is asking for
@@ -1157,8 +1211,15 @@ function NowHub({
             the Now tab listed every way to give a location out and none to ask
             for one. Same flow and same voice control id as that entry -- this
             is an additional way in, not a second implementation. */}
+        {/* Not `Send`: that is the same paper-plane silhouette as `Navigation`
+            on "Share location" two rows up, so at row size the two entries read
+            as the same icon -- and they are opposites. A speech bubble asking a
+            question is distinct at a glance and matches what the flow does:
+            "Requests should explain why. The other person chooses whether to
+            share." Radar and Crosshair were rejected for implying tracking on a
+            surface built around consent. */}
         <SettingsRow
-          icon={Send}
+          icon={MessageCircleQuestionMark}
           iconTone="accent"
           title="Request Location"
           density="compact"
@@ -1184,7 +1245,7 @@ function NowHub({
       <QuickActionsSection title="Quick actions" columns={2}>
         <QuickActionCard
           tone="green"
-          icon={<ShieldCheck className="h-5 w-5" />}
+          icon={<ShieldCheck />}
           title="Check-In"
           subtitle={checkInSubtitle}
           onClick={onCheckIn}
@@ -1192,7 +1253,7 @@ function NowHub({
         />
         <QuickActionCard
           tone="red"
-          icon={<Shield className="h-5 w-5" />}
+          icon={<Shield />}
           title="SMS"
           subtitle={vm.sosActive ? "Live now" : "Save my soul"}
           onClick={onSos}
@@ -1322,7 +1383,11 @@ function LocationDetailFlow({
                 <SharedWithMeCard
                   key={grant.id}
                   name={vm.grantOwnerLabel(grant)}
-                  statusLine={vm.expiresLabel(grant.expiresAt)}
+                  statusLine={
+                    grant.expiresAt
+                      ? `Access until ${vm.formatDateTime(grant.expiresAt)}`
+                      : "Access active"
+                  }
                   previewExpanded={expanded}
                   mapHref={point ? vm.mapLocationHref(point) : undefined}
                   onView={() => onExpandGrant(grant)}
@@ -1407,11 +1472,14 @@ function LocationToggle({
   onChange,
   label,
   disabled = false,
+  voiceControlId,
 }: {
   checked: boolean;
   onChange: (next: boolean) => void;
   label: string;
   disabled?: boolean;
+  /** Anchors contract actions to this control so voice offers them only here. */
+  voiceControlId?: string;
 }) {
   return (
     <button
@@ -1420,6 +1488,7 @@ function LocationToggle({
       aria-checked={checked}
       aria-label={label}
       disabled={disabled}
+      data-voice-control-id={voiceControlId}
       onClick={() => onChange(!checked)}
       className={cn(
         "relative h-[31px] w-[51px] shrink-0 rounded-full transition-colors duration-200",
@@ -1483,6 +1552,7 @@ function LocationSettingsFlow({
               }}
               label="Pause my location"
               disabled={BUSY(vm, "selfLocation")}
+              voiceControlId="one-location-updates-toggle"
             />
           }
           density="compact"
@@ -1648,30 +1718,36 @@ function PeopleHub({
           title="Connections"
           description="Connections and Circle members are eligible for explicit private sharing."
         >
-          <div className="grid grid-cols-1 gap-2">
-            <Button
-              onClick={onAddConnections}
-              data-voice-control-id="one-location-add-connections"
-              className="h-11 rounded-full bg-[color:var(--app-accent)] text-sm font-semibold text-[color:var(--app-accent-fg)] hover:bg-[color:var(--app-accent)]/90"
-            >
-              <UsersRound className="mr-2 h-4 w-4" />
-              Add Connections
-            </Button>
-            <Button
-              variant="outline"
-              onClick={onInvite}
-              data-voice-control-id="one-location-action-invite"
-              className="h-10 rounded-full text-sm font-semibold"
-            >
-              <UserPlus className="mr-2 h-4 w-4" />
-              Invite trusted person
-            </Button>
-            <div className="grid grid-cols-2 gap-2">
+          {/* Symmetric action layout with generous breathing room: a 2-col
+              primary row (Add / Invite) over a matching 2-col contact row
+              (Sync / Share), uniform h-12 buttons and gap-3.5 spacing. On
+              narrow phones the primary row collapses to one column. */}
+          <div className="space-y-3.5">
+            <div className="grid grid-cols-1 gap-3.5 sm:grid-cols-2">
+              <Button
+                onClick={onAddConnections}
+                data-voice-control-id="one-location-add-connections"
+                className="h-12 w-full font-medium"
+              >
+                <UsersRound className="mr-2 h-4 w-4" />
+                Add Connections
+              </Button>
+              <Button
+                variant="outline"
+                onClick={onInvite}
+                data-voice-control-id="one-location-action-invite"
+                className="h-12 w-full font-medium"
+              >
+                <UserPlus className="mr-2 h-4 w-4" />
+                Invite trusted person
+              </Button>
+            </div>
+            <div className="grid grid-cols-2 gap-3.5">
               <Button
                 variant="outline"
                 onClick={vm.onSyncContacts}
                 isLoading={vm.busy === "contactSync"}
-                className="h-10 rounded-full text-sm"
+                className="h-12 w-full font-medium"
               >
                 Sync contacts
               </Button>
@@ -1679,7 +1755,7 @@ function PeopleHub({
                 variant="outline"
                 onClick={vm.onShareToContacts}
                 isLoading={vm.busy === "contactInvite"}
-                className="h-10 rounded-full text-sm"
+                className="h-12 w-full font-medium"
               >
                 Share to contacts
               </Button>
@@ -1717,31 +1793,34 @@ function PeopleHub({
       />
 
       {/* Compact circle-management actions. Invite adds people; "Sync contacts"
-          tags which existing connections are in your phone contacts. */}
-      <div className="grid grid-cols-1 gap-2">
-        <Button
-          onClick={onAddConnections}
-          data-voice-control-id="one-location-add-connections"
-          className="h-10 rounded-full bg-[color:var(--app-accent)] text-sm font-semibold text-[color:var(--app-accent-fg)] hover:bg-[color:var(--app-accent)]/90"
-        >
-          <UsersRound className="mr-2 h-4 w-4" />
-          Add Connections
-        </Button>
-        <Button
-          variant="outline"
-          onClick={onInvite}
-          data-voice-control-id="one-location-action-invite"
-          className="h-10 rounded-full border-[color:var(--app-accent)] text-sm font-semibold text-[color:var(--app-accent)]"
-        >
-          <UserPlus className="mr-2 h-4 w-4" />
-          Invite trusted person
-        </Button>
-        <div className="grid grid-cols-2 gap-2">
+          tags which existing connections are in your phone contacts. Symmetric
+          2-col rows with gap-3.5 and uniform h-12 buttons for breathing room. */}
+      <div className="space-y-3.5">
+        <div className="grid grid-cols-1 gap-3.5 sm:grid-cols-2">
+          <Button
+            onClick={onAddConnections}
+            data-voice-control-id="one-location-add-connections"
+            className="h-12 w-full font-medium"
+          >
+            <UsersRound className="mr-2 h-4 w-4" />
+            Add Connections
+          </Button>
+          <Button
+            variant="outline"
+            onClick={onInvite}
+            data-voice-control-id="one-location-action-invite"
+            className="h-12 w-full font-medium border-[color:var(--app-accent)] text-[color:var(--app-accent)]"
+          >
+            <UserPlus className="mr-2 h-4 w-4" />
+            Invite trusted person
+          </Button>
+        </div>
+        <div className="grid grid-cols-2 gap-3.5">
           <Button
             variant="outline"
             onClick={vm.onSyncContacts}
             isLoading={vm.busy === "contactSync"}
-            className="h-10 rounded-full text-sm"
+            className="h-12 w-full font-medium"
           >
             Sync contacts
           </Button>
@@ -1749,7 +1828,7 @@ function PeopleHub({
             variant="outline"
             onClick={vm.onShareToContacts}
             isLoading={vm.busy === "contactInvite"}
-            className="h-10 rounded-full text-sm"
+            className="h-12 w-full font-medium"
           >
             Share to contacts
           </Button>
@@ -1806,28 +1885,19 @@ function PeopleHub({
       )}
 
       {/* Ask someone to share — request another person's live location. */}
-      <button
-        type="button"
-        onClick={onAsk}
-        data-voice-control-id="one-location-action-ask"
-        className={cn(
-          "flex min-h-[60px] w-full items-center gap-3.5 p-3.5 text-left transition-colors hover:bg-foreground/[0.025]",
-          SUBCARD_SURFACE,
-        )}
-      >
-        <span className="flex h-[34px] w-[34px] shrink-0 items-center justify-center rounded-[10px] bg-[color:var(--app-accent)]/12">
-          <Navigation className="h-[17px] w-[17px] text-[color:var(--app-accent)]" />
-        </span>
-        <span className="min-w-0 flex-1">
-          <span className="block text-[17px] font-normal leading-[22px] text-[color:var(--app-accent)]">
-            Ask someone to share
-          </span>
-          <span className="block text-[15px] leading-5 text-muted-foreground">
-            Send a request — they approve first.
-          </span>
-        </span>
-        <ChevronRight className="h-4 w-4 shrink-0 text-[color:var(--app-tertiary-label)]" />
-      </button>
+      <SettingsGroup separatorInset>
+        <SettingsRow
+          icon={Navigation}
+          iconTone="accent"
+          title="Ask someone to share"
+          description="Send a request — they approve first."
+          density="compact"
+          chevron
+          onClick={onAsk}
+          voiceControlId="one-location-action-ask"
+          voiceActionId="location.open_ask"
+        />
+      </SettingsGroup>
 
       {vm.requestedByMe.length ? (
         <SettingsGroup title="Requests sent" separatorInset>
@@ -1888,17 +1958,18 @@ function ActiveLinkRow({
         {icon}
       </span>
       <div className="min-w-0 flex-1">
-        <p className="truncate text-[17px] font-normal leading-[22px] text-foreground">
+        <RowLabel as="p" className="truncate">
           {title}
-        </p>
-        <p className="mt-0.5 truncate text-[15px] leading-5 text-muted-foreground">
+        </RowLabel>
+        <RowDescription as="p" className="mt-0.5 truncate">
           {subtitle}
-        </p>
+        </RowDescription>
       </div>
       <Button
         variant="outline"
         onClick={onCopy}
-        className="h-9 shrink-0 rounded-full border-[color:var(--app-accent)] px-4 text-[14px] font-semibold text-[color:var(--app-accent)]"
+        size="sm"
+        className="shrink-0 border-[color:var(--app-accent)] px-4 text-[color:var(--app-accent)]"
       >
         Copy
       </Button>
@@ -1919,9 +1990,9 @@ function LinksHub({
 
   return (
     <div className="space-y-4">
-      <p className={cn(SECTION_HEADING, "px-[6px]")}>
+      <SectionTitle as="h2" className="px-[6px]">
         Active links
-      </p>
+      </SectionTitle>
 
       {hasLinks ? (
         <div className={cn("overflow-hidden px-3.5", SUBCARD_SURFACE)}>
@@ -1956,7 +2027,7 @@ function LinksHub({
       <Button
         onClick={onCreateTempLink}
         data-voice-control-id="one-location-action-temp-link"
-        className="h-12 w-full rounded-full bg-[color:var(--app-accent)] text-[15px] font-semibold text-[color:var(--app-accent-fg)] hover:bg-[color:var(--app-accent)]/90"
+        className="w-full"
       >
         <Plus className="mr-2 h-4 w-4" />
         Create a new link
@@ -2118,6 +2189,7 @@ function ShareFlow({
           <Button
             onClick={vm.onConfirmShare}
             isLoading={vm.busy === "share"}
+            data-voice-control-id="one-location-confirm-share"
             className="h-12 w-full rounded-2xl bg-[color:var(--app-accent)] text-base font-semibold text-[color:var(--app-accent-fg)] hover:bg-[color:var(--app-accent)]/90"
           >
             Start sharing
@@ -2200,7 +2272,7 @@ function ShareFlow({
           onClick={vm.onOpenShareReview}
           disabled={!vm.canShare || shareNoteLimitExceeded}
           isLoading={vm.busy === "share"}
-          className="h-12 w-full rounded-2xl bg-[color:var(--app-accent)] text-base font-semibold text-[color:var(--app-accent-fg)] hover:bg-[color:var(--app-accent)]/90 disabled:opacity-50"
+          className="h-12 w-full rounded-2xl bg-[color:var(--app-accent)] text-base font-semibold text-[color:var(--app-accent-fg)] hover:bg-[color:var(--app-accent)]/90 disabled:bg-black/10 disabled:text-black/35 disabled:opacity-100 dark:disabled:bg-white/10 dark:disabled:text-white/35"
         >
           Review share
         </Button>
@@ -2282,6 +2354,7 @@ function ShareFlow({
       <PersonSearchInput
         value={vm.shareRecipientSearch}
         onChange={vm.setShareRecipientSearch}
+        voiceControlId="one-location-share-recipient-search"
       />
       {filtered.length ? (
         <div className={PEOPLE_LIST_SCROLL_CLASS}>
@@ -2327,7 +2400,7 @@ function ShareFlow({
       <Button
         onClick={() => setStep("details")}
         disabled={!selectedReady.length}
-        className="h-12 w-full rounded-2xl bg-[color:var(--app-accent)] text-base font-semibold text-[color:var(--app-accent-fg)] hover:bg-[color:var(--app-accent)]/90 disabled:opacity-50"
+        className="h-12 w-full rounded-2xl bg-[color:var(--app-accent)] text-base font-semibold text-[color:var(--app-accent-fg)] hover:bg-[color:var(--app-accent)]/90 disabled:bg-black/10 disabled:text-black/35 disabled:opacity-100 dark:disabled:bg-white/10 dark:disabled:text-white/35"
       >
         Continue
       </Button>
@@ -2382,6 +2455,10 @@ function AskFlow({
   onClose: () => void;
 }) {
   const filtered = vm.visibleRecipients;
+  // Keep the person on this screen after sending so the confirmation is tied to
+  // the specific request they just made, rather than popping straight back to
+  // the hub. `justSent` latches the success state and blocks duplicate submits.
+  const [justSent, setJustSent] = useState(false);
   return (
     <div className="space-y-5">
       <TaskFlowHeader
@@ -2389,6 +2466,19 @@ function AskFlow({
         title="Make it comfortable"
         description="Requests should explain why. The other person chooses whether to share."
       />
+
+      {justSent ? (
+        <div
+          role="status"
+          className="flex items-start gap-2.5 rounded-2xl border border-[color:var(--app-success)]/30 bg-[color:var(--app-success)]/10 px-3.5 py-3"
+        >
+          <ShieldCheck className="mt-0.5 h-[18px] w-[18px] shrink-0 text-[color:var(--app-success)]" />
+          <p className="text-sm font-medium text-foreground">
+            Request sent. We&apos;ll notify you here when they respond.
+          </p>
+        </div>
+      ) : null}
+
 
       <SectionCard title="Person">
         <PersonSearchInput
@@ -2426,15 +2516,25 @@ function AskFlow({
       </SectionCard>
 
       <SectionCard title="Duration requested">
+        {/* Dropdown picker (not chips) to match the Share location screen's
+            duration field — same shared DurationSelector `select` presentation. */}
         <DurationSelector
           value={vm.durationHours}
           onChange={vm.setDurationHours}
           label=""
+          presentation="select"
         />
       </SectionCard>
 
       <SectionCard title="Reason">
-        <ReasonChips value={reason} onChange={setReason} label="" />
+        {/* Dropdown (not chips) to match the Duration field's select
+            presentation on this same screen. */}
+        <ReasonChips
+          value={reason}
+          onChange={setReason}
+          label=""
+          presentation="select"
+        />
       </SectionCard>
 
       <SectionCard title="Message">
@@ -2452,17 +2552,59 @@ function AskFlow({
         description="They approve, decline, or ignore."
       />
 
-      <Button
-        onClick={() => {
-          vm.onSendRequest(reason);
-          onClose();
-        }}
-        disabled={!vm.selectedRequestOwnerIds.length}
-        isLoading={vm.busy === "request"}
-        className="h-12 w-full rounded-2xl bg-[color:var(--app-accent)] text-base font-semibold text-[color:var(--app-accent-fg)] hover:bg-[color:var(--app-accent)]/90 disabled:opacity-50"
-      >
-        Send request
-      </Button>
+      {/* Send is enabled once at least one recipient is chosen. Duration and
+          reason default to sensible values, so gating Send on them too (added
+          in #5108) blocked submitting even when the request was already valid;
+          that extra gating is intentionally removed here. The "Request Sent"
+          success latch below is preserved. */}
+      {(() => {
+        const isFormValid = vm.selectedRequestOwnerIds.length > 0;
+        const sending = vm.busy === "request";
+        return (
+          <Button
+            onClick={() => {
+              // Never submit an incomplete form even if the click somehow
+              // reaches the handler (e.g. keyboard/AT), and never double-fire
+              // once it has already succeeded.
+              if (!isFormValid || sending || justSent) return;
+              vm.onSendRequest(reason);
+              // Stay on this screen and show inline confirmation tied to THIS
+              // request instead of popping straight back to the hub. The button
+              // latches to a disabled "Request Sent" success state so a second
+              // tap cannot fire a duplicate request.
+              setJustSent(true);
+            }}
+            disabled={!isFormValid || sending || justSent}
+            aria-disabled={!isFormValid || sending || justSent}
+            isLoading={sending}
+            className={cn(
+              "h-12 w-full rounded-2xl text-base font-semibold text-[color:var(--app-accent-fg)] disabled:pointer-events-none",
+              justSent
+                ? "bg-[color:var(--app-success)] opacity-100 hover:bg-[color:var(--app-success)]"
+                : "bg-[color:var(--app-accent)] hover:bg-[color:var(--app-accent)]/90 disabled:bg-black/10 disabled:text-black/35 disabled:opacity-100 dark:disabled:bg-white/10 dark:disabled:text-white/35",
+            )}
+          >
+            {justSent ? (
+              <>
+                <ShieldCheck className="mr-1.5 h-[18px] w-[18px]" aria-hidden />
+                Request Sent
+              </>
+            ) : (
+              "Send request"
+            )}
+          </Button>
+        );
+      })()}
+
+      {justSent ? (
+        <Button
+          variant="ghost"
+          onClick={onClose}
+          className="h-11 w-full rounded-2xl text-sm"
+        >
+          Done
+        </Button>
+      ) : null}
     </div>
   );
 }
