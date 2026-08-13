@@ -558,7 +558,29 @@ export class OneLocationService {
     return response.preferences;
   }
 
+  /**
+   * Persist the "Auto-share my location" toggle server-side and reconcile
+   * auto-created shares. ON fans out an auto-share grant to every
+   * location-eligible, key-ready peer; OFF tears down only the auto-created
+   * shares and leaves manual shares untouched. Reversible and idempotent.
+   */
+  static async setAutoShare(params: {
+    vaultOwnerToken: string;
+    enabled: boolean;
+  }): Promise<{
+    autoShareEnabled: boolean;
+    action: "fan_out" | "teardown";
+    affectedShareCount: number;
+  }> {
+    return apiJson("/api/one/location/auto-share", {
+      method: "POST",
+      headers: jsonAuthHeaders(params.vaultOwnerToken),
+      body: JSON.stringify({ enabled: params.enabled }),
+    });
+  }
+
   static async chat(params: {
+
     vaultOwnerToken: string;
     message?: string;
     conversationId?: string | null;

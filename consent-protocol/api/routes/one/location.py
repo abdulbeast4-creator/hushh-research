@@ -121,6 +121,11 @@ class UpdateMapPreferencesRequest(_CamelModel):
     )
 
 
+class SetAutoShareRequest(_CamelModel):
+    enabled: bool
+
+
+
 class CreateAccessRequest(_CamelModel):
     owner_user_id: str = Field(alias="ownerUserId", min_length=1, max_length=160)
     message: str | None = Field(default=None, max_length=500)
@@ -462,8 +467,28 @@ def update_location_map_preferences(
         raise _handle_error(exc) from exc
 
 
+@router.post("/location/auto-share")
+def set_location_auto_share(
+    payload: SetAutoShareRequest,
+    token_data: dict = Depends(require_vault_owner_token),
+):
+    """Persist the Auto-share toggle and reconcile auto-created shares.
+
+    ON fans out an auto-share grant to every location-eligible, key-ready peer;
+    OFF tears down only the auto-created shares and leaves manual shares intact.
+    """
+    try:
+        return _service().set_auto_share_enabled(
+            user_id=_user_id(token_data),
+            enabled=payload.enabled,
+        )
+    except Exception as exc:
+        raise _handle_error(exc) from exc
+
+
 @router.get("/location/activity")
 def get_location_activity(
+
     range_key: str = Query(default="30d", alias="range", pattern="^(7d|30d|90d|all)$"),
     limit: int = Query(default=40, ge=1, le=100),
     token_data: dict = Depends(require_vault_owner_token),

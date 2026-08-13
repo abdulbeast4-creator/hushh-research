@@ -7773,14 +7773,50 @@ export function OneLocationAgentPageContent({
         autoShareEnabled: enabled,
       }));
       if (!enabled) setBackgroundShareEnabled(false);
+      // Persist the toggle server-side and reconcile auto-created shares. ON
+      // fans out an auto-share grant to every location-eligible, key-ready peer;
+      // OFF tears down only the auto-created shares and leaves manual shares
+      // untouched. Best-effort: the optimistic local state above already
+      // reflects the choice, so a transient network failure only defers the
+      // fan-out/teardown to the next toggle rather than blocking the UI. A
+      // failure reverts the in-memory flag so the two never silently disagree.
+      if (vaultOwnerToken) {
+        void OneLocationService.setAutoShare({
+          vaultOwnerToken,
+          enabled,
+        })
+          .then((result) => {
+            if (result.affectedShareCount > 0) {
+              // Refresh so the newly auto-created (or torn-down) shares appear
+              // in this owner's "Sharing" list immediately.
+              void refresh({ background: true });
+            }
+
+          })
+          .catch((error) => {
+            updateOneLocationControlState(auth.userId, (current) => ({
+              ...current,
+              autoShareEnabled: !enabled,
+            }));
+            automaticPrivatePublishingAllowedRef.current =
+              !enabled && !locationControl.paused;
+            toast.error(
+              enabled
+                ? "Couldn't turn on auto-share. Try again."
+                : "Couldn't turn off auto-share. Try again.",
+            );
+            console.error("one_location.set_auto_share_failed", error);
+          });
+      }
       toast.success(
         enabled
-          ? "Approved shares will receive live updates."
-          : "Approved shares will update only when you explicitly share.",
+          ? "Auto-sharing your live location with your connections and Circles."
+          : "Auto-sharing off. Approved shares update only when you explicitly share.",
       );
     },
-    [auth.userId, locationControl.paused],
+    [auth.userId, locationControl.paused, vaultOwnerToken],
   );
+
 
   const markLocationOnboardingSeen = useCallback(() => {
     // Persist only after completion so an interrupted first run can resume next

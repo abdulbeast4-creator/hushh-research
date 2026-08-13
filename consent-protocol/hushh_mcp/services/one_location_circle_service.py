@@ -1246,6 +1246,34 @@ class OneLocationCircleService:
                         circle_id,
                         exc_info=True,
                     )
+                # Auto-share hook. A fresh Circle join makes the joiner and
+                # every existing member mutually location-eligible. Honor
+                # each account persisted Auto-share flag. Best-effort and
+                # post-commit: membership is already durable, so a failure
+                # never undoes the join. Gated per owner inside
+                # auto_start_share_for_new_peer.
+                try:
+                    from hushh_mcp.services.one_location_agent_service import (
+                        OneLocationAgentService,
+                    )
+
+                    location_service = OneLocationAgentService()
+                    for member in circle.get("members") or []:
+                        member_user_id = str(member.get("userId") or "").strip()
+                        if not member_user_id or member_user_id == user_id:
+                            continue
+                        location_service.auto_start_share_for_new_peer(
+                            owner_user_id=user_id, peer_user_id=member_user_id
+                        )
+                        location_service.auto_start_share_for_new_peer(
+                            owner_user_id=member_user_id, peer_user_id=user_id
+                        )
+                except Exception:
+                    logger.warning(
+                        "one_location.circle_joined_auto_share_failed circle=%s",
+                        circle_id,
+                        exc_info=True,
+                    )
             return {
                 "circle": circle,
                 "joined": joined,

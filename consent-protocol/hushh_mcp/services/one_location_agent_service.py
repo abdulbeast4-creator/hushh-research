@@ -74,6 +74,18 @@ COORDINATE_METADATA_KEYS = {
 LOCATION_TERMINAL_RETENTION_HOURS = 12
 ATOMIC_LOCATION_SHARE_NAMESPACE = uuid.UUID("ef983dac-5044-49b0-9d35-c523b3437a54")
 
+# Provenance marker written to grant metadata (`metadata.source`) when the
+# Auto-share fan-out or an auto-start hook creates a grant. Toggle-off tears down
+# ONLY grants carrying this marker, so a manually created share is never touched.
+AUTO_SHARE_GRANT_SOURCE = "auto_share"
+
+# Duration for an auto-created share. The owner keeps sharing live location for
+# this window; while Auto-share stays on, the frontend live-update pipeline keeps
+# each share fresh and the owner can extend or revoke any of them manually.
+AUTO_SHARE_DURATION_HOURS = 24.0
+
+
+
 
 def _bounded_int_env(name: str, default: int, minimum: int, maximum: int) -> int:
     try:
@@ -3838,9 +3850,11 @@ class OneLocationAgentService:
         source_circle_id: str | None = None,
         require_recipient_phone_verified: bool = True,
         enforce_connection: bool = False,
+        source: str | None = None,
         _key_writer_guarded: bool = False,
     ) -> dict[str, Any]:
         if owner_user_id == recipient_user_id:
+
             raise OneLocationAgentError(
                 "LOCATION_RECIPIENT_SELF",
                 "Choose a different verified recipient.",
@@ -3861,9 +3875,11 @@ class OneLocationAgentService:
                     source_circle_id=source_circle_id,
                     require_recipient_phone_verified=require_recipient_phone_verified,
                     enforce_connection=enforce_connection,
+                    source=source,
                     _key_writer_guarded=True,
                 )
             resolved_kind = share_kind or _classify_share_kind(reason)
+
             if reason != "request_approved" and resolved_kind != "sos":
                 self._send_location_share_created_notification(
                     grant=grant,
@@ -4740,19 +4756,54 @@ class OneLocationAgentService:
         """
         row = self._execute_one(
             """
-            SELECT presence_mode, renderer_consent_version, updated_at
+            SELECT presence_mode, renderer_consent_version, auto_share_enabled, updated_at
             FROM one_location_map_preferences
             WHERE user_id = :user_id
             LIMIT 1
             """,
             {"user_id": user_id},
         )
+        # A missing row (never opened the preference) defaults to auto-share ON,
+        # matching the shipped frontend default. The `is None` guard preserves an
+        # explicit stored FALSE rather than coercing it back to the default.
+        auto_share_value = (row or {}).get("auto_share_enabled")
         return {
             "presenceMode": str((row or {}).get("presence_mode") or "ghost"),
             "rendererConsentVersion": str((row or {}).get("renderer_consent_version") or "")
             or None,
+            "autoShareEnabled": True if auto_share_value is None else bool(auto_share_value),
             "updatedAt": _iso((row or {}).get("updated_at")),
         }
+
+    def get_auto_share_enabled(self, *, user_id: str) -> bool:
+        """Owner-scoped source of truth for the Auto-share toggle.
+
+        Fails open to the shipped default (ON) when the preference row or the
+        additive column is missing, so an environment a migration behind keeps
+        the pre-existing behavior instead of silently disabling auto-share.
+        """
+        try:
+            row = self._execute_one(
+                """
+                SELECT auto_share_enabled
+                FROM one_location_map_preferences
+                WHERE user_id = :user_id
+                LIMIT 1
+                """,
+                {"user_id": user_id},
+            )
+        except Exception as exc:  # noqa: BLE001 - additive column rollout
+            logger.warning(
+                "one_location.auto_share_flag_read_failed user=%s error=%s",
+                redact_log_field("user_id", user_id),
+                exc,
+            )
+            return True
+        if not row:
+            return True
+        value = row.get("auto_share_enabled")
+        return True if value is None else bool(value)
+
 
     def update_map_preferences(
         self,
@@ -5837,6 +5888,159 @@ class OneLocationAgentService:
             ],
             "capabilityScopes": LOCATION_CAPABILITY_SCOPES,
         }
+
+    def _has_active_grant(self, *, owner_user_id: str, recipient_user_id: str) -> bool:
+        """True when the owner already has any active grant to this recipient."""
+        try:
+            row = self._execute_one(
+                """
+                SELECT 1
+                FROM one_location_share_grants
+                WHERE owner_user_id = :owner_user_id
+                  AND recipient_user_id = :recipient_user_id
+                  AND status = 'active'
+                LIMIT 1
+                """,
+                {
+                    "owner_user_id": owner_user_id,
+                    "recipient_user_id": recipient_user_id,
+                },
+            )
+        except Exception as exc:  # noqa: BLE001 - duplicate-avoidance fails closed
+            logger.warning(
+                "one_location.auto_share_active_grant_lookup_failed owner=%s error=%s",
+                redact_log_field("owner_user_id", owner_user_id),
+                exc,
+            )
+            return True
+        return row is not None
+
+    def _create_auto_share_grant(
+        self, *, owner_user_id: str, recipient_user_id: str
+    ) -> dict[str, Any] | None:
+        """Create one relationship-gated, provenance-tagged auto-share grant."""
+        try:
+            return self.create_grant(
+                owner_user_id=owner_user_id,
+                recipient_user_id=recipient_user_id,
+                recipient_key_id=None,
+                duration_hours=AUTO_SHARE_DURATION_HOURS,
+                reason="owner_approved",
+                share_kind="share",
+                enforce_connection=True,
+                source=AUTO_SHARE_GRANT_SOURCE,
+            )
+        except OneLocationAgentError as exc:
+            logger.info(
+                "one_location.auto_share_grant_skipped owner=%s code=%s",
+                redact_log_field("owner_user_id", owner_user_id),
+                exc.code,
+            )
+            return None
+        except Exception as exc:  # noqa: BLE001 - one peer cannot fail the fan-out
+            logger.warning(
+                "one_location.auto_share_grant_failed owner=%s error=%s",
+                redact_log_field("owner_user_id", owner_user_id),
+                exc,
+            )
+            return None
+
+    def _auto_share_fan_out(self, *, owner_user_id: str) -> int:
+        """Fan an auto-share grant out to every eligible, key-ready peer."""
+        created = 0
+        for recipient in self.list_verified_recipients(owner_user_id=owner_user_id):
+            recipient_user_id = str(recipient.get("userId") or "").strip()
+            if not recipient_user_id or recipient_user_id == owner_user_id:
+                continue
+            if not recipient.get("canReceiveLocation"):
+                continue
+            if self._has_active_grant(
+                owner_user_id=owner_user_id, recipient_user_id=recipient_user_id
+            ):
+                continue
+            if self._create_auto_share_grant(
+                owner_user_id=owner_user_id, recipient_user_id=recipient_user_id
+            ):
+                created += 1
+        return created
+
+    def _auto_share_teardown(self, *, owner_user_id: str) -> int:
+        """Revoke ONLY this account active auto-created shares (source == auto_share)."""
+        rows = self._execute_many(
+            """
+            SELECT id
+            FROM one_location_share_grants
+            WHERE owner_user_id = :owner_user_id
+              AND status = 'active'
+              AND metadata->>'source' = :auto_share_source
+            """,
+            {
+                "owner_user_id": owner_user_id,
+                "auto_share_source": AUTO_SHARE_GRANT_SOURCE,
+            },
+        )
+        revoked = 0
+        for row in rows:
+            grant_id = str(row.get("id") or "").strip()
+            if not grant_id:
+                continue
+            try:
+                self.revoke_grant(owner_user_id=owner_user_id, grant_id=grant_id)
+                revoked += 1
+            except Exception as exc:  # noqa: BLE001 - one failure cannot block teardown
+                logger.warning(
+                    "one_location.auto_share_teardown_revoke_failed owner=%s error=%s",
+                    redact_log_field("owner_user_id", owner_user_id),
+                    exc,
+                )
+        return revoked
+
+    def set_auto_share_enabled(self, *, user_id: str, enabled: bool) -> dict[str, Any]:
+        """Persist the Auto-share toggle and reconcile auto-created shares."""
+        if not user_id:
+            raise OneLocationAgentError(
+                "LOCATION_AUTH_REQUIRED", "A user is required.", status_code=401
+            )
+        self._execute_one(
+            """
+            INSERT INTO one_location_map_preferences (
+              user_id, auto_share_enabled, created_at, updated_at
+            ) VALUES (:user_id, :auto_share_enabled, NOW(), NOW())
+            ON CONFLICT (user_id) DO UPDATE SET
+              auto_share_enabled = :auto_share_enabled,
+              updated_at = NOW()
+            """,
+            {"user_id": user_id, "auto_share_enabled": bool(enabled)},
+        )
+        if enabled:
+            affected = self._auto_share_fan_out(owner_user_id=user_id)
+            action = "fan_out"
+        else:
+            affected = self._auto_share_teardown(owner_user_id=user_id)
+            action = "teardown"
+        return {
+            "autoShareEnabled": bool(enabled),
+            "action": action,
+            "affectedShareCount": affected,
+        }
+
+    def auto_start_share_for_new_peer(
+        self, *, owner_user_id: str, peer_user_id: str
+    ) -> dict[str, Any] | None:
+        """Start an auto-share to a peer that just became eligible."""
+        owner_user_id = str(owner_user_id or "").strip()
+        peer_user_id = str(peer_user_id or "").strip()
+        if not owner_user_id or not peer_user_id or owner_user_id == peer_user_id:
+            return None
+        if not self.get_auto_share_enabled(user_id=owner_user_id):
+            return None
+        if self._has_active_grant(
+            owner_user_id=owner_user_id, recipient_user_id=peer_user_id
+        ):
+            return None
+        return self._create_auto_share_grant(
+            owner_user_id=owner_user_id, recipient_user_id=peer_user_id
+        )
 
     def revoke_grant(self, *, owner_user_id: str, grant_id: str) -> dict[str, Any]:
         row = self._execute_one(
